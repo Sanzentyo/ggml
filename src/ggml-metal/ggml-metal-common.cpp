@@ -3,6 +3,9 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include <algorithm>
+#include <map>
+#include <unordered_map>
 #include <vector>
 
 // represents a memory range (i.e. an interval from a starting address p0 to an ending address p1 in a given buffer pb)
@@ -16,8 +19,17 @@ struct ggml_mem_range {
     ggml_mem_range_type pt;
 };
 
+struct ggml_mem_interval_set {
+    std::map<uint64_t, uint64_t> data;
+};
+
+struct ggml_mem_buffer_ranges {
+    ggml_mem_interval_set src;
+    ggml_mem_interval_set dst;
+};
+
 struct ggml_mem_ranges {
-    std::vector<ggml_mem_range> ranges;
+    std::unordered_map<uint64_t, ggml_mem_buffer_ranges> buffers;
 
     int debug = 0;
 };
@@ -25,7 +37,7 @@ struct ggml_mem_ranges {
 ggml_mem_ranges_t ggml_mem_ranges_init(int debug) {
     auto * res = new ggml_mem_ranges;
 
-    res->ranges.reserve(256);
+    res->buffers.reserve(64);
     res->debug = debug;
 
     return res;
@@ -36,11 +48,30 @@ void ggml_mem_ranges_free(ggml_mem_ranges_t mrs) {
 }
 
 void ggml_mem_ranges_reset(ggml_mem_ranges_t mrs) {
-    mrs->ranges.clear();
+    mrs->buffers.clear();
 }
 
-static bool ggml_mem_ranges_add(ggml_mem_ranges_t mrs, ggml_mem_range mr) {
-    mrs->ranges.push_back(mr);
+static bool ggml_mem_interval_set_add(ggml_mem_interval_set & is, uint64_t p0, uint64_t p1) {
+    auto it = is.data.lower_bound(p0);
+
+    uint64_t q0 = p0;
+    uint64_t q1 = p1;
+
+    if (it != is.data.begin()) {
+        auto prev = std::prev(it);
+        if (prev->second >= q0) {
+            q0 = prev->first;
+            q1 = std::max(q1, prev->second);
+            it = is.data.erase(prev);
+        }
+    }
+
+    while (it != is.data.end() && it->first <= q1) {
+        q1 = std::max(q1, it->second);
+        it = is.data.erase(it);
+    }
+
+    is.data.emplace(q0, q1);
 
     return true;
 }
@@ -96,7 +127,7 @@ static bool ggml_mem_ranges_add_src(ggml_mem_ranges_t mrs, const ggml_tensor * t
         GGML_LOG_DEBUG("%s: add src range buf=%lld, [%lld, %lld)\n", __func__, mr.pb, mr.p0, mr.p1);
     }
 
-    return ggml_mem_ranges_add(mrs, mr);
+    return ggml_mem_interval_set_add(mrs->buffers[mr.pb].src, mr.p0, mr.p1);
 }
 
 static bool ggml_mem_ranges_add_dst(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
@@ -108,7 +139,7 @@ static bool ggml_mem_ranges_add_dst(ggml_mem_ranges_t mrs, const ggml_tensor * t
         GGML_LOG_DEBUG("%s: add dst range buf=%lld, [%lld, %lld)\n", __func__, mr.pb, mr.p0, mr.p1);
     }
 
-    return ggml_mem_ranges_add(mrs, mr);
+    return ggml_mem_interval_set_add(mrs->buffers[mr.pb].dst, mr.p0, mr.p1);
 }
 
 bool ggml_mem_ranges_add(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
@@ -121,32 +152,37 @@ bool ggml_mem_ranges_add(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
     return ggml_mem_ranges_add_dst(mrs, tensor);
 }
 
-static bool ggml_mem_ranges_check(ggml_mem_ranges_t mrs, ggml_mem_range mr) {
-    for (size_t i = 0; i < mrs->ranges.size(); i++) {
-        const auto & cmp = mrs->ranges[i];
+static bool ggml_mem_interval_set_check(const ggml_mem_ranges * mrs, const ggml_mem_interval_set & is, ggml_mem_range mr, ggml_mem_range_type cmp_type) {
+    auto it = is.data.upper_bound(mr.p0);
 
-        // two memory ranges cannot intersect if they are in different buffers
-        if (mr.pb != cmp.pb) {
-            continue;
-        }
+    if (it != is.data.begin()) {
+        const auto prev = std::prev(it);
 
-        // intersecting source ranges are allowed
-        if (mr.pt == MEM_RANGE_TYPE_SRC && cmp.pt == MEM_RANGE_TYPE_SRC) {
-            continue;
-        }
-
-        if (mr.p0 < cmp.p1 && mr.p1 >= cmp.p0) {
+        if (mr.p0 < prev->second) {
             if (mrs->debug > 2) {
                 GGML_LOG_DEBUG("%s: the %s range buf=%lld, [%lld, %lld) overlaps with a previous %s range buf=%lld, [%lld, %lld)\n",
                         __func__,
                         mr.pt == MEM_RANGE_TYPE_SRC ? "src" : "dst",
                         mr.pb, mr.p0, mr.p1,
-                        cmp.pt == MEM_RANGE_TYPE_SRC ? "src" : "dst",
-                        cmp.pb, cmp.p0, cmp.p1);
+                        cmp_type == MEM_RANGE_TYPE_SRC ? "src" : "dst",
+                        mr.pb, prev->first, prev->second);
             }
 
             return false;
         }
+    }
+
+    if (it != is.data.end() && it->first <= mr.p1) {
+        if (mrs->debug > 2) {
+            GGML_LOG_DEBUG("%s: the %s range buf=%lld, [%lld, %lld) overlaps with a previous %s range buf=%lld, [%lld, %lld)\n",
+                    __func__,
+                    mr.pt == MEM_RANGE_TYPE_SRC ? "src" : "dst",
+                    mr.pb, mr.p0, mr.p1,
+                    cmp_type == MEM_RANGE_TYPE_SRC ? "src" : "dst",
+                    mr.pb, it->first, it->second);
+        }
+
+        return false;
     }
 
     return true;
@@ -157,7 +193,12 @@ static bool ggml_mem_ranges_check_src(ggml_mem_ranges_t mrs, const ggml_tensor *
 
     ggml_mem_range mr = ggml_mem_range_from_tensor_src(tensor);
 
-    const bool res = ggml_mem_ranges_check(mrs, mr);
+    const auto it = mrs->buffers.find(mr.pb);
+    if (it == mrs->buffers.end()) {
+        return true;
+    }
+
+    const bool res = ggml_mem_interval_set_check(mrs, it->second.dst, mr, MEM_RANGE_TYPE_DST);
 
     return res;
 }
@@ -167,7 +208,14 @@ static bool ggml_mem_ranges_check_dst(ggml_mem_ranges_t mrs, const ggml_tensor *
 
     ggml_mem_range mr = ggml_mem_range_from_tensor_dst(tensor);
 
-    const bool res = ggml_mem_ranges_check(mrs, mr);
+    const auto it = mrs->buffers.find(mr.pb);
+    if (it == mrs->buffers.end()) {
+        return true;
+    }
+
+    const bool res =
+        ggml_mem_interval_set_check(mrs, it->second.src, mr, MEM_RANGE_TYPE_SRC) &&
+        ggml_mem_interval_set_check(mrs, it->second.dst, mr, MEM_RANGE_TYPE_DST);
 
     return res;
 }

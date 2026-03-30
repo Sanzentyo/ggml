@@ -11,6 +11,7 @@ typedef struct ggml_metal_op * ggml_metal_op_t;
 ggml_metal_op_t ggml_metal_op_init(
         ggml_metal_device_t dev,
         ggml_metal_cmd_buf_t cmd_buf,
+        void * profile_cb,
         struct ggml_cgraph * gf,
         int  idx_start,
         int  idx_end,
@@ -90,6 +91,9 @@ int ggml_metal_op_tri               (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_opt_step_adamw    (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_opt_step_sgd      (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_count_equal       (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_win_part          (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_win_unpart        (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_conv_2d_dw       (ggml_metal_op_t ctx, int idx);
 
 #ifdef __cplusplus
 }

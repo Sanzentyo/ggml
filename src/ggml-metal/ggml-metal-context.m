@@ -189,7 +189,7 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 void ggml_metal_free(ggml_metal_t ctx) {
     GGML_LOG_INFO("%s: deallocating\n", __func__);
 
-    for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
+    for (int i = 0; i <= GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
         if (ctx->cmd_bufs[i].obj) {
             [ctx->cmd_bufs[i].obj release];
         }
@@ -239,7 +239,11 @@ const char * ggml_metal_get_name(ggml_metal_t ctx) {
 void ggml_metal_synchronize(ggml_metal_t ctx) {
     // wait for any backend operations to finish
     if (ctx->cmd_buf_last) {
+        const uint64_t t_wait = ggml_metal_profile_enabled() ? ggml_time_us() : 0;
         [ctx->cmd_buf_last waitUntilCompleted];
+        if (ggml_metal_profile_enabled()) {
+            ggml_metal_profile_note_command_buffer_wait(-1, ggml_time_us() - t_wait);
+        }
         ctx->cmd_buf_last = nil;
     }
 
@@ -262,6 +266,7 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
                 ctx->has_error = true;
                 return;
             }
+
         }
     }
 
@@ -291,6 +296,10 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
         }
 
         [ctx->cmd_bufs_ext removeAllObjects];
+    }
+
+    if (ggml_metal_profile_enabled()) {
+        ggml_metal_profile_finalize_and_log();
     }
 }
 
@@ -436,6 +445,8 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
 }
 
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
+    const uint64_t t_graph_start = ggml_metal_profile_enabled() ? ggml_time_us() : 0;
+
     if (ctx->has_error) {
         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
         return GGML_STATUS_FAILED;
@@ -456,6 +467,10 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     // each thread creates it's own command buffer and enqueues the ops in parallel
     //
     // tests on M1 Pro and M2 Ultra using LLaMA models, show that optimal values for n_cb are 1 or 2
+
+    if (ggml_metal_profile_enabled()) {
+        ggml_metal_profile_begin_graph(ctx->dev, gf->n_nodes);
+    }
 
     @autoreleasepool {
         ctx->gf = gf;
@@ -509,8 +524,12 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         // the main thread commits the first few commands immediately
         // cmd_buf[n_cb]
         {
+            const uint64_t t_cb = ggml_metal_profile_enabled() ? ggml_time_us() : 0;
             id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
             [cmd_buf retain];
+            if (ggml_metal_profile_enabled()) {
+                ggml_metal_profile_note_command_buffer_create(n_cb, cmd_buf, ggml_time_us() - t_cb);
+            }
 
             if (ctx->cmd_bufs[n_cb].obj) {
                 [ctx->cmd_bufs[n_cb].obj release];
@@ -528,8 +547,12 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         // prepare the rest of the command buffers asynchronously (optional)
         // cmd_buf[0.. n_cb)
         for (int cb_idx = 0; cb_idx < n_cb; ++cb_idx) {
+            const uint64_t t_cb = ggml_metal_profile_enabled() ? ggml_time_us() : 0;
             id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
             [cmd_buf retain];
+            if (ggml_metal_profile_enabled()) {
+                ggml_metal_profile_note_command_buffer_create(cb_idx, cmd_buf, ggml_time_us() - t_cb);
+            }
 
             if (ctx->cmd_bufs[cb_idx].obj) {
                 [ctx->cmd_bufs[cb_idx].obj release];
@@ -609,6 +632,10 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
             ctx->capture_started = false;
         }
+    }
+
+    if (ggml_metal_profile_enabled()) {
+        ggml_metal_profile_note_graph_compute_us(ggml_time_us() - t_graph_start);
     }
 
     return GGML_STATUS_SUCCESS;
@@ -695,6 +722,7 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
         ggml_metal_op_t ctx_op = ggml_metal_op_init(
             ctx->dev,
             cmd_buf,
+            ggml_metal_profile_get_cb(cb_idx),
             ctx->gf,
             idx_start,
             idx_end,
@@ -716,7 +744,11 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
         ggml_metal_op_free(ctx_op);
 
         if (cb_idx < 2 || ctx->abort_callback == NULL) {
+            const uint64_t t_commit = ggml_metal_profile_enabled() ? ggml_time_us() : 0;
             [cmd_buf commit];
+            if (ggml_metal_profile_enabled()) {
+                ggml_metal_profile_note_command_buffer_commit(cb_idx, ggml_time_us() - t_commit);
+            }
         }
     });
 }

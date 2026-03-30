@@ -7,6 +7,9 @@
 #include <Metal/Metal.h>
 
 #include <stdatomic.h>
+#include <inttypes.h>
+#include <pthread.h>
+#include <string.h>
 
 #ifndef TARGET_OS_VISION
 #define TARGET_OS_VISION 0
@@ -23,6 +26,571 @@
 // overload of MTLGPUFamilyMetalX (not available in some environments)
 static const NSInteger MTLGPUFamilyMetal3_GGML = 5001;
 static const NSInteger MTLGPUFamilyMetal4_GGML = 5002;
+
+#define GGML_METAL_PROFILE_MAX_CBS         9
+#define GGML_METAL_PROFILE_MAX_KERNELS   512
+#define GGML_METAL_PROFILE_MAX_NAME       96
+
+struct ggml_metal_profile_dispatch {
+    enum ggml_op op;
+    char pipeline[GGML_METAL_PROFILE_MAX_NAME];
+    uint32_t tg0;
+    uint32_t tg1;
+    uint32_t tg2;
+    uint32_t tptg0;
+    uint32_t tptg1;
+    uint32_t tptg2;
+    uint32_t sample0;
+    uint32_t sample1;
+};
+
+struct ggml_metal_profile_cb {
+    int cb_idx;
+    id<MTLCommandBuffer> cmd_buf;
+    id<MTLCounterSampleBuffer> sample_buf;
+    uint32_t sample_next;
+    uint32_t dispatch_count;
+    uint32_t dispatch_cap;
+    struct ggml_metal_profile_dispatch * dispatches;
+};
+
+struct ggml_metal_profile_op_stats {
+    uint64_t encode_count;
+    uint64_t host_encode_us;
+    uint64_t concurrency_us;
+    uint64_t set_pipeline_us;
+    uint64_t set_bytes_us;
+    uint64_t set_buffer_us;
+    uint64_t dispatch_us;
+    uint64_t dispatch_count;
+    uint64_t gpu_ns;
+};
+
+struct ggml_metal_profile_kernel_stats {
+    char name[GGML_METAL_PROFILE_MAX_NAME];
+    uint64_t dispatch_count;
+    uint64_t gpu_ns;
+};
+
+struct ggml_metal_profile_state {
+    bool active;
+    bool sample_dispatch;
+    bool printed;
+
+    size_t dispatch_cap;
+
+    id<MTLCounterSet> timestamp_counter_set;
+
+    uint64_t graph_compute_us;
+
+    uint64_t cmd_buf_create_count;
+    uint64_t cmd_buf_create_us;
+    uint64_t cmd_buf_commit_count;
+    uint64_t cmd_buf_commit_us;
+    uint64_t cmd_buf_wait_count;
+    uint64_t cmd_buf_wait_us;
+
+    uint64_t encoder_create_count;
+    uint64_t encoder_create_us;
+    uint64_t encoder_end_count;
+    uint64_t encoder_end_us;
+    uint64_t memory_barrier_count;
+    uint64_t memory_barrier_us;
+
+    uint64_t pipeline_lookup_count;
+    uint64_t pipeline_lookup_hit_count;
+    uint64_t pipeline_lookup_us;
+    uint64_t pipeline_compile_count;
+    uint64_t pipeline_compile_us;
+
+    uint64_t set_pipeline_count;
+    uint64_t set_pipeline_us;
+    uint64_t set_bytes_count;
+    uint64_t set_bytes_us;
+    uint64_t set_buffer_count;
+    uint64_t set_buffer_us;
+    uint64_t dispatch_count;
+    uint64_t dispatch_us;
+
+    uint64_t gpu_kernel_ns;
+    uint64_t gpu_dispatch_profiled;
+
+    struct ggml_metal_profile_op_stats ops[GGML_OP_COUNT];
+
+    struct ggml_metal_profile_kernel_stats kernels[GGML_METAL_PROFILE_MAX_KERNELS];
+    int n_kernels;
+
+    struct ggml_metal_profile_cb cbs[GGML_METAL_PROFILE_MAX_CBS];
+};
+
+static pthread_mutex_t g_ggml_metal_profile_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct ggml_metal_profile_state g_ggml_metal_profile = {};
+
+static bool ggml_metal_profile_env_enabled(void) {
+    static int cached = -1;
+    if (cached == -1) {
+        const char * val = getenv("GGML_METAL_PROFILE");
+        cached = val && atoi(val) != 0;
+    }
+    return cached != 0;
+}
+
+static bool ggml_metal_log_pipelines_enabled(void) {
+    static int cached = -1;
+    if (cached == -1) {
+        const char * val = getenv("GGML_METAL_LOG_PIPELINES");
+        cached = val && atoi(val) != 0;
+    }
+    return cached != 0;
+}
+
+static void ggml_metal_profile_reset_locked(void) {
+    for (int i = 0; i < GGML_METAL_PROFILE_MAX_CBS; ++i) {
+        if (g_ggml_metal_profile.cbs[i].sample_buf) {
+            [g_ggml_metal_profile.cbs[i].sample_buf release];
+        }
+        free(g_ggml_metal_profile.cbs[i].dispatches);
+    }
+
+    memset(&g_ggml_metal_profile, 0, sizeof(g_ggml_metal_profile));
+}
+
+static id<MTLCounterSet> ggml_metal_profile_get_timestamp_counter_set(id<MTLDevice> device) {
+    if (![device supportsCounterSampling:MTLCounterSamplingPointAtDispatchBoundary]) {
+        return nil;
+    }
+
+    for (id<MTLCounterSet> counter_set in device.counterSets) {
+        if ([counter_set.name isEqualToString:MTLCommonCounterSetTimestamp]) {
+            return counter_set;
+        }
+    }
+
+    return nil;
+}
+
+static void ggml_metal_profile_add_kernel_gpu_locked(const char * name, uint64_t gpu_ns) {
+    if (!name || name[0] == '\0') {
+        name = "(unknown)";
+    }
+
+    for (int i = 0; i < g_ggml_metal_profile.n_kernels; ++i) {
+        if (strncmp(g_ggml_metal_profile.kernels[i].name, name, GGML_METAL_PROFILE_MAX_NAME) == 0) {
+            g_ggml_metal_profile.kernels[i].dispatch_count++;
+            g_ggml_metal_profile.kernels[i].gpu_ns += gpu_ns;
+            return;
+        }
+    }
+
+    if (g_ggml_metal_profile.n_kernels >= GGML_METAL_PROFILE_MAX_KERNELS) {
+        return;
+    }
+
+    struct ggml_metal_profile_kernel_stats * kernel = &g_ggml_metal_profile.kernels[g_ggml_metal_profile.n_kernels++];
+    snprintf(kernel->name, sizeof(kernel->name), "%s", name);
+    kernel->dispatch_count = 1;
+    kernel->gpu_ns = gpu_ns;
+}
+
+static int ggml_metal_profile_cmp_kernel_count_desc(const void * a, const void * b) {
+    const struct ggml_metal_profile_kernel_stats * ka = (const struct ggml_metal_profile_kernel_stats *) a;
+    const struct ggml_metal_profile_kernel_stats * kb = (const struct ggml_metal_profile_kernel_stats *) b;
+    if (ka->dispatch_count < kb->dispatch_count) return 1;
+    if (ka->dispatch_count > kb->dispatch_count) return -1;
+    return strcmp(ka->name, kb->name);
+}
+
+static int ggml_metal_profile_cmp_kernel_gpu_desc(const void * a, const void * b) {
+    const struct ggml_metal_profile_kernel_stats * ka = (const struct ggml_metal_profile_kernel_stats *) a;
+    const struct ggml_metal_profile_kernel_stats * kb = (const struct ggml_metal_profile_kernel_stats *) b;
+    if (ka->gpu_ns < kb->gpu_ns) return 1;
+    if (ka->gpu_ns > kb->gpu_ns) return -1;
+    return strcmp(ka->name, kb->name);
+}
+
+bool ggml_metal_profile_enabled(void) {
+    return ggml_metal_profile_env_enabled();
+}
+
+void ggml_metal_profile_begin_graph(ggml_metal_device_t dev, int n_nodes) {
+    if (!ggml_metal_profile_enabled()) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_ggml_metal_profile_lock);
+    ggml_metal_profile_reset_locked();
+    g_ggml_metal_profile.active = true;
+    g_ggml_metal_profile.dispatch_cap = MAX((size_t) 4096, (size_t) n_nodes * 8);
+    g_ggml_metal_profile.timestamp_counter_set = ggml_metal_profile_get_timestamp_counter_set(ggml_metal_device_get_obj(dev));
+    g_ggml_metal_profile.sample_dispatch = g_ggml_metal_profile.timestamp_counter_set != nil;
+    pthread_mutex_unlock(&g_ggml_metal_profile_lock);
+}
+
+void * ggml_metal_profile_get_cb(int cb_idx) {
+    if (!ggml_metal_profile_enabled()) {
+        return NULL;
+    }
+
+    if (cb_idx < 0 || cb_idx >= GGML_METAL_PROFILE_MAX_CBS) {
+        return NULL;
+    }
+
+    return &g_ggml_metal_profile.cbs[cb_idx];
+}
+
+void ggml_metal_profile_note_graph_compute_us(uint64_t us) {
+    if (!ggml_metal_profile_enabled()) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_ggml_metal_profile_lock);
+    g_ggml_metal_profile.graph_compute_us += us;
+    pthread_mutex_unlock(&g_ggml_metal_profile_lock);
+}
+
+void ggml_metal_profile_note_command_buffer_create(int cb_idx, ggml_metal_cmd_buf_t cmd_buf_raw, uint64_t us) {
+    if (!ggml_metal_profile_enabled()) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_ggml_metal_profile_lock);
+
+    g_ggml_metal_profile.cmd_buf_create_count++;
+    g_ggml_metal_profile.cmd_buf_create_us += us;
+
+    if (cb_idx >= 0 && cb_idx < GGML_METAL_PROFILE_MAX_CBS) {
+        struct ggml_metal_profile_cb * cb = &g_ggml_metal_profile.cbs[cb_idx];
+        cb->cb_idx = cb_idx;
+        cb->cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
+        if (cb->dispatch_cap == 0) {
+            cb->dispatch_cap = (uint32_t) g_ggml_metal_profile.dispatch_cap;
+            cb->dispatches = calloc(cb->dispatch_cap, sizeof(struct ggml_metal_profile_dispatch));
+        }
+
+        if (g_ggml_metal_profile.sample_dispatch && cb->sample_buf == nil) {
+            id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
+            id<MTLDevice> device = cmd_buf.commandQueue.device;
+
+            MTLCounterSampleBufferDescriptor * desc = [MTLCounterSampleBufferDescriptor new];
+            desc.counterSet = g_ggml_metal_profile.timestamp_counter_set;
+            desc.storageMode = MTLStorageModeShared;
+            desc.sampleCount = g_ggml_metal_profile.dispatch_cap * 2;
+            desc.label = [NSString stringWithFormat:@"ggml-metal-profile-cb-%d", cb_idx];
+
+            NSError * error = nil;
+            cb->sample_buf = [device newCounterSampleBufferWithDescriptor:desc error:&error];
+            [desc release];
+
+            if (cb->sample_buf) {
+            } else {
+                g_ggml_metal_profile.sample_dispatch = false;
+                if (error) {
+                    GGML_LOG_WARN("%s: unable to create counter sample buffer: %s\n", __func__, [[error localizedDescription] UTF8String]);
+                }
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&g_ggml_metal_profile_lock);
+}
+
+void ggml_metal_profile_note_command_buffer_commit(int cb_idx, uint64_t us) {
+    GGML_UNUSED(cb_idx);
+
+    if (!ggml_metal_profile_enabled()) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_ggml_metal_profile_lock);
+    g_ggml_metal_profile.cmd_buf_commit_count++;
+    g_ggml_metal_profile.cmd_buf_commit_us += us;
+    pthread_mutex_unlock(&g_ggml_metal_profile_lock);
+}
+
+void ggml_metal_profile_note_command_buffer_wait(int cb_idx, uint64_t us) {
+    GGML_UNUSED(cb_idx);
+
+    if (!ggml_metal_profile_enabled()) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_ggml_metal_profile_lock);
+    g_ggml_metal_profile.cmd_buf_wait_count++;
+    g_ggml_metal_profile.cmd_buf_wait_us += us;
+    pthread_mutex_unlock(&g_ggml_metal_profile_lock);
+}
+
+void ggml_metal_profile_note_encoder_create(uint64_t us) {
+    if (!ggml_metal_profile_enabled()) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_ggml_metal_profile_lock);
+    g_ggml_metal_profile.encoder_create_count++;
+    g_ggml_metal_profile.encoder_create_us += us;
+    pthread_mutex_unlock(&g_ggml_metal_profile_lock);
+}
+
+void ggml_metal_profile_note_encoder_end(uint64_t us) {
+    if (!ggml_metal_profile_enabled()) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_ggml_metal_profile_lock);
+    g_ggml_metal_profile.encoder_end_count++;
+    g_ggml_metal_profile.encoder_end_us += us;
+    pthread_mutex_unlock(&g_ggml_metal_profile_lock);
+}
+
+void ggml_metal_profile_note_memory_barrier(uint64_t us) {
+    if (!ggml_metal_profile_enabled()) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_ggml_metal_profile_lock);
+    g_ggml_metal_profile.memory_barrier_count++;
+    g_ggml_metal_profile.memory_barrier_us += us;
+    pthread_mutex_unlock(&g_ggml_metal_profile_lock);
+}
+
+void ggml_metal_profile_note_op_encode(enum ggml_op op, uint64_t total_us, uint64_t concurrency_us) {
+    if (!ggml_metal_profile_enabled()) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_ggml_metal_profile_lock);
+    g_ggml_metal_profile.ops[op].encode_count++;
+    g_ggml_metal_profile.ops[op].host_encode_us += total_us;
+    g_ggml_metal_profile.ops[op].concurrency_us += concurrency_us;
+    pthread_mutex_unlock(&g_ggml_metal_profile_lock);
+}
+
+void ggml_metal_profile_finalize_and_log(void) {
+    if (!ggml_metal_profile_enabled()) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_ggml_metal_profile_lock);
+
+    if (!g_ggml_metal_profile.active || g_ggml_metal_profile.printed) {
+        pthread_mutex_unlock(&g_ggml_metal_profile_lock);
+        return;
+    }
+
+    g_ggml_metal_profile.printed = true;
+
+    uint64_t gpu_span_ns = 0;
+    double gpu_first_s = 0.0;
+    double gpu_last_s = 0.0;
+
+    uint64_t bucket_lt10 = 0;
+    uint64_t bucket_10_50 = 0;
+    uint64_t bucket_50_100 = 0;
+    uint64_t bucket_100_500 = 0;
+    uint64_t bucket_gt500 = 0;
+    uint64_t work_lt1k = 0;
+    uint64_t work_1k_16k = 0;
+    uint64_t work_16k_256k = 0;
+    uint64_t work_gt256k = 0;
+
+    for (int i = 0; i < GGML_METAL_PROFILE_MAX_CBS; ++i) {
+        struct ggml_metal_profile_cb * cb = &g_ggml_metal_profile.cbs[i];
+        if (!cb->cmd_buf) {
+            continue;
+        }
+
+        const NSTimeInterval kernel_start = cb->cmd_buf.kernelStartTime;
+        const NSTimeInterval kernel_end = cb->cmd_buf.kernelEndTime;
+        const uint64_t cb_gpu_ns = kernel_end > kernel_start ? (uint64_t) ((kernel_end - kernel_start) * 1e9) : 0;
+        g_ggml_metal_profile.gpu_kernel_ns += cb_gpu_ns;
+
+        if (kernel_end > kernel_start) {
+            if (gpu_first_s == 0.0 || kernel_start < gpu_first_s) {
+                gpu_first_s = kernel_start;
+            }
+            if (kernel_end > gpu_last_s) {
+                gpu_last_s = kernel_end;
+            }
+        }
+
+        if (cb->dispatch_count == 0) {
+            continue;
+        }
+
+        NSData * resolved = nil;
+        const MTLCounterResultTimestamp * samples = NULL;
+        if (cb->sample_buf != nil && cb->sample_next > 0) {
+            resolved = [cb->sample_buf resolveCounterRange:NSMakeRange(0, cb->sample_next)];
+            if (resolved && resolved.length >= cb->sample_next * sizeof(MTLCounterResultTimestamp)) {
+                samples = (const MTLCounterResultTimestamp *) resolved.bytes;
+            }
+        }
+
+        uint64_t tick_first = UINT64_MAX;
+        uint64_t tick_last = 0;
+        for (uint32_t j = 0; j < cb->dispatch_count; ++j) {
+            const struct ggml_metal_profile_dispatch * rec = &cb->dispatches[j];
+            const uint64_t threads_total =
+                    (uint64_t) rec->tg0 * (uint64_t) rec->tg1 * (uint64_t) rec->tg2 *
+                    (uint64_t) rec->tptg0 * (uint64_t) rec->tptg1 * (uint64_t) rec->tptg2;
+
+            if (threads_total < 1024) {
+                work_lt1k++;
+            } else if (threads_total < 16384) {
+                work_1k_16k++;
+            } else if (threads_total < 262144) {
+                work_16k_256k++;
+            } else {
+                work_gt256k++;
+            }
+
+            ggml_metal_profile_add_kernel_gpu_locked(rec->pipeline, 0);
+
+            if (samples == NULL || rec->sample0 == UINT32_MAX || rec->sample1 == UINT32_MAX) {
+                continue;
+            }
+
+            const uint64_t t0 = samples[rec->sample0].timestamp;
+            const uint64_t t1 = samples[rec->sample1].timestamp;
+            if (t0 == MTLCounterErrorValue || t1 == MTLCounterErrorValue || t1 <= t0) {
+                continue;
+            }
+            tick_first = MIN(tick_first, t0);
+            tick_last = MAX(tick_last, t1);
+        }
+
+        const bool have_dispatch_timestamps = tick_last > tick_first && cb_gpu_ns > 0;
+        const double ns_per_tick = have_dispatch_timestamps ? (double) cb_gpu_ns / (double) (tick_last - tick_first) : 0.0;
+
+        for (uint32_t j = 0; j < cb->dispatch_count; ++j) {
+            const struct ggml_metal_profile_dispatch * rec = &cb->dispatches[j];
+            if (!have_dispatch_timestamps || rec->sample0 == UINT32_MAX || rec->sample1 == UINT32_MAX) {
+                continue;
+            }
+
+            const uint64_t t0 = samples[rec->sample0].timestamp;
+            const uint64_t t1 = samples[rec->sample1].timestamp;
+            if (t0 == MTLCounterErrorValue || t1 == MTLCounterErrorValue || t1 <= t0) {
+                continue;
+            }
+
+            const uint64_t gpu_ns = (uint64_t) ((double) (t1 - t0) * ns_per_tick);
+            g_ggml_metal_profile.gpu_dispatch_profiled++;
+
+            if (rec->op >= 0 && rec->op < GGML_OP_COUNT) {
+                g_ggml_metal_profile.ops[rec->op].gpu_ns += gpu_ns;
+            }
+            ggml_metal_profile_add_kernel_gpu_locked(rec->pipeline, gpu_ns);
+
+            const double gpu_us = gpu_ns / 1000.0;
+            if (gpu_us < 10.0) {
+                bucket_lt10++;
+            } else if (gpu_us < 50.0) {
+                bucket_10_50++;
+            } else if (gpu_us < 100.0) {
+                bucket_50_100++;
+            } else if (gpu_us < 500.0) {
+                bucket_100_500++;
+            } else {
+                bucket_gt500++;
+            }
+        }
+    }
+
+    if (gpu_last_s > gpu_first_s) {
+        gpu_span_ns = (uint64_t) ((gpu_last_s - gpu_first_s) * 1e9);
+    }
+
+    fprintf(stderr, "\nGGML_METAL_PROFILE SUMMARY\n");
+    fprintf(stderr, "  graph_compute_submit_ms: %.3f\n", g_ggml_metal_profile.graph_compute_us / 1000.0);
+    fprintf(stderr, "  gpu_kernel_sum_ms:       %.3f\n", g_ggml_metal_profile.gpu_kernel_ns / 1e6);
+    fprintf(stderr, "  gpu_kernel_span_ms:      %.3f\n", gpu_span_ns / 1e6);
+    fprintf(stderr, "  command_buffers:         created=%" PRIu64 " committed=%" PRIu64 " waited=%" PRIu64 "\n",
+            g_ggml_metal_profile.cmd_buf_create_count,
+            g_ggml_metal_profile.cmd_buf_commit_count,
+            g_ggml_metal_profile.cmd_buf_wait_count);
+    fprintf(stderr, "  compute_encoders:        created=%" PRIu64 " ended=%" PRIu64 "\n",
+            g_ggml_metal_profile.encoder_create_count,
+            g_ggml_metal_profile.encoder_end_count);
+    fprintf(stderr, "  dispatches:              total=%" PRIu64 " profiled=%" PRIu64 " avg_gpu_us=%.3f\n",
+            g_ggml_metal_profile.dispatch_count,
+            g_ggml_metal_profile.gpu_dispatch_profiled,
+            g_ggml_metal_profile.dispatch_count ? (double) g_ggml_metal_profile.gpu_kernel_ns / 1000.0 / (double) g_ggml_metal_profile.dispatch_count : 0.0);
+    fprintf(stderr, "  pipeline_lookup:         count=%" PRIu64 " hits=%" PRIu64 " time_ms=%.3f\n",
+            g_ggml_metal_profile.pipeline_lookup_count,
+            g_ggml_metal_profile.pipeline_lookup_hit_count,
+            g_ggml_metal_profile.pipeline_lookup_us / 1000.0);
+    fprintf(stderr, "  pipeline_compile:        count=%" PRIu64 " time_ms=%.3f\n",
+            g_ggml_metal_profile.pipeline_compile_count,
+            g_ggml_metal_profile.pipeline_compile_us / 1000.0);
+    fprintf(stderr, "  host_components_ms:\n");
+    fprintf(stderr, "    cmd_buffer_create: %.3f\n", g_ggml_metal_profile.cmd_buf_create_us / 1000.0);
+    fprintf(stderr, "    cmd_buffer_commit: %.3f\n", g_ggml_metal_profile.cmd_buf_commit_us / 1000.0);
+    fprintf(stderr, "    cmd_buffer_wait:   %.3f\n", g_ggml_metal_profile.cmd_buf_wait_us / 1000.0);
+    fprintf(stderr, "    encoder_create:    %.3f\n", g_ggml_metal_profile.encoder_create_us / 1000.0);
+    fprintf(stderr, "    encoder_end:       %.3f\n", g_ggml_metal_profile.encoder_end_us / 1000.0);
+    fprintf(stderr, "    memory_barrier:    %.3f\n", g_ggml_metal_profile.memory_barrier_us / 1000.0);
+    fprintf(stderr, "    set_pipeline:      %.3f\n", g_ggml_metal_profile.set_pipeline_us / 1000.0);
+    fprintf(stderr, "    set_bytes:         %.3f\n", g_ggml_metal_profile.set_bytes_us / 1000.0);
+    fprintf(stderr, "    set_buffer:        %.3f\n", g_ggml_metal_profile.set_buffer_us / 1000.0);
+    fprintf(stderr, "    dispatch_submit:   %.3f\n", g_ggml_metal_profile.dispatch_us / 1000.0);
+    fprintf(stderr, "  dispatch_gpu_histogram:\n");
+    fprintf(stderr, "    <10us:    %" PRIu64 "\n", bucket_lt10);
+    fprintf(stderr, "    10-50us:  %" PRIu64 "\n", bucket_10_50);
+    fprintf(stderr, "    50-100us: %" PRIu64 "\n", bucket_50_100);
+    fprintf(stderr, "    100-500us:%" PRIu64 "\n", bucket_100_500);
+    fprintf(stderr, "    >500us:   %" PRIu64 "\n", bucket_gt500);
+    fprintf(stderr, "  dispatch_work_histogram:\n");
+    fprintf(stderr, "    <1k threads:      %" PRIu64 "\n", work_lt1k);
+    fprintf(stderr, "    1k-16k threads:   %" PRIu64 "\n", work_1k_16k);
+    fprintf(stderr, "    16k-256k threads: %" PRIu64 "\n", work_16k_256k);
+    fprintf(stderr, "    >256k threads:    %" PRIu64 "\n", work_gt256k);
+    fprintf(stderr, "  op_breakdown:\n");
+    for (int op = 0; op < GGML_OP_COUNT; ++op) {
+        const struct ggml_metal_profile_op_stats * st = &g_ggml_metal_profile.ops[op];
+        if (st->encode_count == 0 && st->dispatch_count == 0) {
+            continue;
+        }
+        fprintf(stderr, "    %-18s count=%" PRIu64 " host_encode_ms=%.3f concurrency_ms=%.3f host_dispatch_ms=%.3f gpu_ms=%.3f dispatches=%" PRIu64 "\n",
+                ggml_op_name((enum ggml_op) op),
+                st->encode_count,
+                st->host_encode_us / 1000.0,
+                st->concurrency_us / 1000.0,
+                st->dispatch_us / 1000.0,
+                st->gpu_ns / 1e6,
+                st->dispatch_count);
+    }
+
+    if (g_ggml_metal_profile.n_kernels > 0) {
+        struct ggml_metal_profile_kernel_stats by_count[GGML_METAL_PROFILE_MAX_KERNELS];
+        struct ggml_metal_profile_kernel_stats by_gpu[GGML_METAL_PROFILE_MAX_KERNELS];
+        memcpy(by_count, g_ggml_metal_profile.kernels, sizeof(by_count));
+        memcpy(by_gpu,   g_ggml_metal_profile.kernels, sizeof(by_gpu));
+        qsort(by_count, g_ggml_metal_profile.n_kernels, sizeof(by_count[0]), ggml_metal_profile_cmp_kernel_count_desc);
+        qsort(by_gpu,   g_ggml_metal_profile.n_kernels, sizeof(by_gpu[0]),   ggml_metal_profile_cmp_kernel_gpu_desc);
+
+        fprintf(stderr, "  top_kernels_by_count:\n");
+        for (int i = 0; i < MIN(20, g_ggml_metal_profile.n_kernels); ++i) {
+            fprintf(stderr, "    %-40s dispatches=%" PRIu64 " gpu_ms=%.3f\n",
+                    by_count[i].name, by_count[i].dispatch_count, by_count[i].gpu_ns / 1e6);
+        }
+
+        fprintf(stderr, "  top_kernels_by_gpu:\n");
+        if (g_ggml_metal_profile.gpu_dispatch_profiled == 0) {
+            fprintf(stderr, "    (per-dispatch GPU timestamps unavailable on this run)\n");
+        } else {
+            for (int i = 0; i < MIN(20, g_ggml_metal_profile.n_kernels); ++i) {
+                fprintf(stderr, "    %-40s dispatches=%" PRIu64 " gpu_ms=%.3f\n",
+                        by_gpu[i].name, by_gpu[i].dispatch_count, by_gpu[i].gpu_ns / 1e6);
+            }
+        }
+    }
+
+    fprintf(stderr, "END_GGML_METAL_PROFILE\n\n");
+
+    ggml_metal_profile_reset_locked();
+    pthread_mutex_unlock(&g_ggml_metal_profile_lock);
+}
 
 #if !GGML_METAL_EMBED_LIBRARY
 // Here to assist with NSBundle Path Hack
@@ -71,6 +639,7 @@ void ggml_metal_cv_set_bool(ggml_metal_cv_t cv, bool value, int32_t idx) {
 
 struct ggml_metal_pipeline {
     id<MTLComputePipelineState> obj;
+    char name[GGML_METAL_PROFILE_MAX_NAME];
 };
 
 ggml_metal_pipeline_t ggml_metal_pipeline_init(void) {
@@ -78,6 +647,7 @@ ggml_metal_pipeline_t ggml_metal_pipeline_init(void) {
 
     *res = (struct ggml_metal_pipeline) {
         /*.obj  =*/ nil,
+        /*.name =*/ { 0 },
     };
 
     return res;
@@ -226,8 +796,15 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
 
                 MTLCompileOptions * options = [MTLCompileOptions new];
                 options.preprocessorMacros = prep;
-
-                //[options setFastMathEnabled:false];
+                if (@available(macOS 15.0, iOS 18.0, *)) {
+                    options.mathMode = MTLMathModeSafe;
+                    options.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsPrecise;
+                } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+                    options.fastMathEnabled = NO;
+#pragma clang diagnostic pop
+                }
 
                 library = [device newLibraryWithSource:src options:options error:&error];
                 if (error) {
@@ -283,6 +860,15 @@ ggml_metal_library_t ggml_metal_library_init_from_source(ggml_metal_device_t dev
 
         MTLCompileOptions * options = [MTLCompileOptions new];
         options.preprocessorMacros = prep;
+        if (@available(macOS 15.0, iOS 18.0, *)) {
+            options.mathMode = MTLMathModeSafe;
+            options.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsPrecise;
+        } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            options.fastMathEnabled = NO;
+#pragma clang diagnostic pop
+        }
 
         library = [device newLibraryWithSource:src options:options error:&error];
         if (error) {
@@ -342,6 +928,8 @@ void ggml_metal_library_free(ggml_metal_library_t lib) {
 }
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline(ggml_metal_library_t lib, const char * name) {
+    const uint64_t t_start = ggml_metal_profile_enabled() ? ggml_time_us() : 0;
+
     [lib->lock lock];
 
     struct ggml_metal_pipeline_with_params res = {
@@ -358,10 +946,22 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline(ggml_meta
 
     [lib->lock unlock];
 
+    if (ggml_metal_profile_enabled()) {
+        pthread_mutex_lock(&g_ggml_metal_profile_lock);
+        g_ggml_metal_profile.pipeline_lookup_count++;
+        g_ggml_metal_profile.pipeline_lookup_us += ggml_time_us() - t_start;
+        if (res.pipeline) {
+            g_ggml_metal_profile.pipeline_lookup_hit_count++;
+        }
+        pthread_mutex_unlock(&g_ggml_metal_profile_lock);
+    }
+
     return res;
 }
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_metal_library_t lib, const char * base, const char * name, ggml_metal_cv_t cv) {
+    const uint64_t t_start = ggml_metal_profile_enabled() ? ggml_time_us() : 0;
+
     struct ggml_metal_pipeline_with_params res = {
         /*.pipeline =*/ nil,
         /*.nsg      =*/ 0,
@@ -386,7 +986,9 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 
         NSString * base_func = [NSString stringWithUTF8String:base];
 
-        GGML_LOG_DEBUG("%s: compiling pipeline: base = '%s', name = '%s'\n", __func__, base, name);
+        if (ggml_metal_log_pipelines_enabled()) {
+            GGML_LOG_DEBUG("%s: compiling pipeline: base = '%s', name = '%s'\n", __func__, base, name);
+        }
 
         id<MTLFunction> mtl_function;
         if (!cv) {
@@ -420,10 +1022,12 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
             return res;
         }
 
-        GGML_LOG_DEBUG("%s: loaded %-40s %16p | th_max = %4d | th_width = %4d\n", __func__, name,
-                (void *) obj,
-                (int)    obj.maxTotalThreadsPerThreadgroup,
-                (int)    obj.threadExecutionWidth);
+        if (ggml_metal_log_pipelines_enabled()) {
+            GGML_LOG_DEBUG("%s: loaded %-40s %16p | th_max = %4d | th_width = %4d\n", __func__, name,
+                    (void *) obj,
+                    (int)    obj.maxTotalThreadsPerThreadgroup,
+                    (int)    obj.threadExecutionWidth);
+        }
 
         if (obj.maxTotalThreadsPerThreadgroup == 0 || obj.threadExecutionWidth == 0) {
             [obj release];
@@ -437,11 +1041,19 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 
         res.pipeline = ggml_metal_pipeline_init();
         res.pipeline->obj = obj;
+        snprintf(res.pipeline->name, sizeof(res.pipeline->name), "%s", name);
 
         ggml_metal_pipelines_add(lib->pipelines, name, res.pipeline);
     }
 
     [lib->lock unlock];
+
+    if (ggml_metal_profile_enabled()) {
+        pthread_mutex_lock(&g_ggml_metal_profile_lock);
+        g_ggml_metal_profile.pipeline_compile_count++;
+        g_ggml_metal_profile.pipeline_compile_us += ggml_time_us() - t_start;
+        pthread_mutex_unlock(&g_ggml_metal_profile_lock);
+    }
 
     return res;
 }
@@ -452,9 +1064,15 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 
 struct ggml_metal_encoder {
     id<MTLComputeCommandEncoder> obj;
+    void * profile_cb;
+    enum ggml_op current_op;
+    int current_node_idx;
+    char current_pipeline[GGML_METAL_PROFILE_MAX_NAME];
 };
 
-ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent) {
+ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent, void * profile_cb) {
+    const uint64_t t_start = ggml_metal_profile_enabled() ? ggml_time_us() : 0;
+
     ggml_metal_encoder_t res = calloc(1, sizeof(struct ggml_metal_encoder));
 
     id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
@@ -466,6 +1084,14 @@ ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, b
     }
 
     [res->obj retain];
+    res->profile_cb = profile_cb;
+    res->current_op = GGML_OP_NONE;
+    res->current_node_idx = -1;
+    res->current_pipeline[0] = '\0';
+
+    if (ggml_metal_profile_enabled()) {
+        ggml_metal_profile_note_encoder_create(ggml_time_us() - t_start);
+    }
 
     return res;
 }
@@ -483,32 +1109,135 @@ void ggml_metal_encoder_debug_group_pop (ggml_metal_encoder_t encoder) {
     [encoder->obj popDebugGroup];
 }
 
+void ggml_metal_encoder_set_current_op(ggml_metal_encoder_t encoder, enum ggml_op op, int node_idx) {
+    encoder->current_op = op;
+    encoder->current_node_idx = node_idx;
+    encoder->current_pipeline[0] = '\0';
+}
+
 void ggml_metal_encoder_set_pipeline(ggml_metal_encoder_t encoder, struct ggml_metal_pipeline_with_params pipeline) {
+    const uint64_t t_start = ggml_metal_profile_enabled() ? ggml_time_us() : 0;
     [encoder->obj setComputePipelineState:pipeline.pipeline->obj];
+    snprintf(encoder->current_pipeline, sizeof(encoder->current_pipeline), "%s", pipeline.pipeline ? pipeline.pipeline->name : "(unknown)");
+
+    if (ggml_metal_profile_enabled()) {
+        const uint64_t us = ggml_time_us() - t_start;
+        pthread_mutex_lock(&g_ggml_metal_profile_lock);
+        g_ggml_metal_profile.set_pipeline_count++;
+        g_ggml_metal_profile.set_pipeline_us += us;
+        if (encoder->current_op >= 0 && encoder->current_op < GGML_OP_COUNT) {
+            g_ggml_metal_profile.ops[encoder->current_op].set_pipeline_us += us;
+        }
+        pthread_mutex_unlock(&g_ggml_metal_profile_lock);
+    }
 }
 
 void ggml_metal_encoder_set_bytes(ggml_metal_encoder_t encoder, void * data, size_t size, int idx) {
+    const uint64_t t_start = ggml_metal_profile_enabled() ? ggml_time_us() : 0;
     [encoder->obj setBytes:data length:size atIndex:idx];
+    GGML_UNUSED(size);
+    GGML_UNUSED(idx);
+
+    if (ggml_metal_profile_enabled()) {
+        const uint64_t us = ggml_time_us() - t_start;
+        pthread_mutex_lock(&g_ggml_metal_profile_lock);
+        g_ggml_metal_profile.set_bytes_count++;
+        g_ggml_metal_profile.set_bytes_us += us;
+        if (encoder->current_op >= 0 && encoder->current_op < GGML_OP_COUNT) {
+            g_ggml_metal_profile.ops[encoder->current_op].set_bytes_us += us;
+        }
+        pthread_mutex_unlock(&g_ggml_metal_profile_lock);
+    }
 }
 
 void ggml_metal_encoder_set_buffer(ggml_metal_encoder_t encoder, struct ggml_metal_buffer_id buffer, int idx) {
+    const uint64_t t_start = ggml_metal_profile_enabled() ? ggml_time_us() : 0;
     [encoder->obj setBuffer:buffer.metal offset:buffer.offs atIndex:idx];
+    GGML_UNUSED(idx);
+
+    if (ggml_metal_profile_enabled()) {
+        const uint64_t us = ggml_time_us() - t_start;
+        pthread_mutex_lock(&g_ggml_metal_profile_lock);
+        g_ggml_metal_profile.set_buffer_count++;
+        g_ggml_metal_profile.set_buffer_us += us;
+        if (encoder->current_op >= 0 && encoder->current_op < GGML_OP_COUNT) {
+            g_ggml_metal_profile.ops[encoder->current_op].set_buffer_us += us;
+        }
+        pthread_mutex_unlock(&g_ggml_metal_profile_lock);
+    }
 }
 
 void ggml_metal_encoder_set_threadgroup_memory_size(ggml_metal_encoder_t encoder, size_t size, int idx) {
     [encoder->obj setThreadgroupMemoryLength:size atIndex:idx];
+    GGML_UNUSED(encoder);
+    GGML_UNUSED(size);
+    GGML_UNUSED(idx);
 }
 
 void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int tg0, int tg1, int tg2, int tptg0, int tptg1, int tptg2) {
+    const bool do_profile = ggml_metal_profile_enabled();
+    const uint64_t t_start = do_profile ? ggml_time_us() : 0;
+
+    struct ggml_metal_profile_cb * cb = (struct ggml_metal_profile_cb *) encoder->profile_cb;
+    struct ggml_metal_profile_dispatch * rec = NULL;
+
+    if (do_profile && cb && cb->dispatches && cb->dispatch_count < cb->dispatch_cap) {
+        rec = &cb->dispatches[cb->dispatch_count];
+        rec->op = encoder->current_op;
+        snprintf(rec->pipeline, sizeof(rec->pipeline), "%s", encoder->current_pipeline[0] ? encoder->current_pipeline : "(unknown)");
+        rec->tg0 = tg0;
+        rec->tg1 = tg1;
+        rec->tg2 = tg2;
+        rec->tptg0 = tptg0;
+        rec->tptg1 = tptg1;
+        rec->tptg2 = tptg2;
+        rec->sample0 = UINT32_MAX;
+        rec->sample1 = UINT32_MAX;
+
+        if (cb->sample_buf != nil && cb->sample_next + 2 <= cb->sample_buf.sampleCount) {
+            rec->sample0 = cb->sample_next++;
+            [encoder->obj sampleCountersInBuffer:cb->sample_buf atSampleIndex:rec->sample0 withBarrier:NO];
+        }
+    }
+
     [encoder->obj dispatchThreadgroups:MTLSizeMake(tg0, tg1, tg2) threadsPerThreadgroup:MTLSizeMake(tptg0, tptg1, tptg2)];
+
+    if (do_profile) {
+        if (cb && rec != NULL && cb->sample_buf != nil && rec->sample0 != UINT32_MAX && cb->sample_next + 1 <= cb->sample_buf.sampleCount) {
+            rec->sample1 = cb->sample_next++;
+            [encoder->obj sampleCountersInBuffer:cb->sample_buf atSampleIndex:rec->sample1 withBarrier:NO];
+        }
+
+        if (cb && cb->dispatch_count < cb->dispatch_cap) {
+            cb->dispatch_count++;
+        }
+
+        const uint64_t us = ggml_time_us() - t_start;
+        pthread_mutex_lock(&g_ggml_metal_profile_lock);
+        g_ggml_metal_profile.dispatch_count++;
+        g_ggml_metal_profile.dispatch_us += us;
+        if (encoder->current_op >= 0 && encoder->current_op < GGML_OP_COUNT) {
+            g_ggml_metal_profile.ops[encoder->current_op].dispatch_count++;
+            g_ggml_metal_profile.ops[encoder->current_op].dispatch_us += us;
+        }
+        pthread_mutex_unlock(&g_ggml_metal_profile_lock);
+    }
 }
 
 void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder) {
+    const uint64_t t_start = ggml_metal_profile_enabled() ? ggml_time_us() : 0;
     [encoder->obj memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    if (ggml_metal_profile_enabled()) {
+        ggml_metal_profile_note_memory_barrier(ggml_time_us() - t_start);
+    }
 }
 
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {
+    const uint64_t t_start = ggml_metal_profile_enabled() ? ggml_time_us() : 0;
     [encoder->obj endEncoding];
+    if (ggml_metal_profile_enabled()) {
+        ggml_metal_profile_note_encoder_end(ggml_time_us() - t_start);
+    }
 }
 
 struct ggml_metal_device {
@@ -608,8 +1337,21 @@ void ggml_metal_rsets_free(ggml_metal_rsets_t rsets) {
         return;
     }
 
-    // note: if you hit this assert, most likely you haven't deallocated all Metal resources before exiting
-    GGML_ASSERT([rsets->data count] == 0);
+    if ([rsets->data count] != 0) {
+        GGML_LOG_WARN("%s: freeing %d residency sets that were still registered at shutdown\n",
+                __func__, (int) [rsets->data count]);
+#if defined(GGML_METAL_HAS_RESIDENCY_SETS)
+        if (@available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 2.0, *)) {
+            for (int i = 0; i < (int) [rsets->data count]; ++i) {
+                id<MTLResidencySet> rset = rsets->data[i];
+                [rset endResidency];
+                [rset removeAllAllocations];
+                [rset release];
+            }
+        }
+#endif
+        [rsets->data removeAllObjects];
+    }
 
     atomic_store_explicit(&rsets->d_stop, true, memory_order_relaxed);
 
@@ -993,6 +1735,36 @@ void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t
     }
 }
 
+static bool ggml_metal_device_supports_flash_attn_ext_shape(const struct ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_FLASH_ATTN_EXT);
+
+    const int64_t dq = op->src[0]->ne[0];
+    const int64_t dk = op->src[1]->ne[0];
+    const int64_t dv = op->src[2]->ne[0];
+
+    if (dq != dk) {
+        return false;
+    }
+
+    switch (dk) {
+        case 16:  return dv == 16;
+        case 32:  return dv == 32;
+        case 40:  return dv == 40;
+        case 48:  return dv == 48;
+        case 64:  return dv == 64;
+        case 72:  return dv == 72;
+        case 80:  return dv == 80;
+        case 96:  return dv == 96;
+        case 112: return dv == 112;
+        case 128: return dv == 128;
+        case 192: return dv == 192 || dv == 128;
+        case 256: return dv == 256;
+        case 320: return dv == 256;
+        case 576: return dv == 512;
+        default:  return false;
+    }
+}
+
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op) {
     const bool has_simdgroup_mm        = dev->props.has_simdgroup_mm;
     const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
@@ -1118,6 +1890,13 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                    (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32);
         case GGML_OP_UPSCALE:
             return op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_WIN_PART:
+        case GGML_OP_WIN_UNPART:
+            return op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_CONV_2D_DW:
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->type == GGML_TYPE_F32;
         case GGML_OP_POOL_1D:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_POOL_2D:
@@ -1139,6 +1918,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_ARANGE:
             return true;
         case GGML_OP_FLASH_ATTN_EXT:
+            if (op->src[1]->type != op->src[2]->type) {
+                return false;
+            }
             // for new head sizes, add checks here
             if (op->src[0]->ne[0] != 32 &&
                 op->src[0]->ne[0] != 40 &&
@@ -1156,7 +1938,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 op->src[0]->ne[0] != 576) {
                 return false;
             }
-            if (op->src[1]->type != op->src[2]->type) {
+            if (!ggml_metal_device_supports_flash_attn_ext_shape(op)) {
                 return false;
             }
             return has_simdgroup_mm; // TODO: over-restricted for vec-kernels

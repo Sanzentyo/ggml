@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml.h"
+#include "ggml-metal-common.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -72,11 +73,12 @@ typedef void * ggml_metal_cmd_buf_t;
 
 typedef struct ggml_metal_encoder * ggml_metal_encoder_t;
 
-ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent);
+ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent, void * profile_cb);
 void ggml_metal_encoder_free(ggml_metal_encoder_t encoder);
 
 void ggml_metal_encoder_debug_group_push(ggml_metal_encoder_t encoder, const char * name);
 void ggml_metal_encoder_debug_group_pop (ggml_metal_encoder_t encoder);
+void ggml_metal_encoder_set_current_op (ggml_metal_encoder_t encoder, enum ggml_op op, int node_idx);
 
 void ggml_metal_encoder_set_pipeline(ggml_metal_encoder_t encoder, struct ggml_metal_pipeline_with_params pipeline);
 
@@ -152,6 +154,10 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_3d  
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_upscale           (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pad               (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pad_reflect_1d    (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_win_part          (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_win_unpart        (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_2d_dw       (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cont_f32         (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_arange            (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_timestep_embedding(ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_opt_step_adamw    (ggml_metal_library_t lib, const struct ggml_tensor * op);
@@ -262,6 +268,19 @@ void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op);
 
 const struct ggml_metal_device_props * ggml_metal_device_get_props(ggml_metal_device_t dev);
+
+bool  ggml_metal_profile_enabled(void);
+void  ggml_metal_profile_begin_graph(ggml_metal_device_t dev, int n_nodes);
+void *ggml_metal_profile_get_cb(int cb_idx);
+void  ggml_metal_profile_note_graph_compute_us(uint64_t us);
+void  ggml_metal_profile_note_command_buffer_create(int cb_idx, ggml_metal_cmd_buf_t cmd_buf_raw, uint64_t us);
+void  ggml_metal_profile_note_command_buffer_commit(int cb_idx, uint64_t us);
+void  ggml_metal_profile_note_command_buffer_wait(int cb_idx, uint64_t us);
+void  ggml_metal_profile_note_encoder_create(uint64_t us);
+void  ggml_metal_profile_note_encoder_end(uint64_t us);
+void  ggml_metal_profile_note_memory_barrier(uint64_t us);
+void  ggml_metal_profile_note_op_encode(enum ggml_op op, uint64_t total_us, uint64_t concurrency_us);
+void  ggml_metal_profile_finalize_and_log(void);
 
 //
 // device buffers

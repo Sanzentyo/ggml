@@ -2949,6 +2949,47 @@ struct ggml_cplan ggml_graph_plan(
     return cplan;
 }
 
+struct ggml_cpu_profile_op_stats {
+    uint64_t count;
+    uint64_t wall_us;
+};
+
+static struct ggml_cpu_profile_op_stats g_ggml_cpu_profile_ops[GGML_OP_COUNT];
+
+static bool ggml_cpu_profile_enabled(void) {
+    static int cached = -1;
+    if (cached == -1) {
+        const char * val = getenv("GGML_CPU_PROFILE");
+        cached = val && atoi(val) != 0;
+    }
+    return cached != 0;
+}
+
+static void ggml_cpu_profile_reset(void) {
+    memset(g_ggml_cpu_profile_ops, 0, sizeof(g_ggml_cpu_profile_ops));
+}
+
+static void ggml_cpu_profile_add(enum ggml_op op, uint64_t wall_us) {
+    g_ggml_cpu_profile_ops[op].count++;
+    g_ggml_cpu_profile_ops[op].wall_us += wall_us;
+}
+
+static void ggml_cpu_profile_log(void) {
+    fprintf(stderr, "\nGGML_CPU_PROFILE SUMMARY\n");
+    for (int op = 0; op < GGML_OP_COUNT; ++op) {
+        if (g_ggml_cpu_profile_ops[op].count == 0) {
+            continue;
+        }
+
+        fprintf(stderr, "  %-18s count=%" PRIu64 " wall_ms=%.3f avg_us=%.3f\n",
+                ggml_op_name((enum ggml_op) op),
+                g_ggml_cpu_profile_ops[op].count,
+                g_ggml_cpu_profile_ops[op].wall_us / 1000.0,
+                g_ggml_cpu_profile_ops[op].count ? (double) g_ggml_cpu_profile_ops[op].wall_us / (double) g_ggml_cpu_profile_ops[op].count : 0.0);
+    }
+    fprintf(stderr, "END_GGML_CPU_PROFILE\n\n");
+}
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
@@ -2973,6 +3014,15 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
+    const bool do_profile = state->ith == 0 && ggml_cpu_profile_enabled();
+    enum ggml_op pending_last_op = GGML_OP_NONE;
+    uint64_t pending_last_t_start = 0;
+    bool pending_last = false;
+
+    if (do_profile) {
+        ggml_cpu_profile_reset();
+    }
+
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
@@ -2985,6 +3035,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+        const uint64_t t_node_start = do_profile ? ggml_time_us() : 0;
+
         ggml_compute_forward(&params, node);
 
         if (state->ith == 0 && cplan->abort_callback &&
@@ -2995,6 +3047,13 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
+            if (do_profile) {
+                ggml_cpu_profile_add(node->op, ggml_time_us() - t_node_start);
+            }
+        } else if (do_profile) {
+            pending_last = true;
+            pending_last_op = node->op;
+            pending_last_t_start = t_node_start;
         }
     }
 
@@ -3005,6 +3064,13 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #endif
 
     ggml_barrier(state->threadpool);
+
+    if (do_profile) {
+        if (pending_last) {
+            ggml_cpu_profile_add(pending_last_op, ggml_time_us() - pending_last_t_start);
+        }
+        ggml_cpu_profile_log();
+    }
 
     return 0;
 }

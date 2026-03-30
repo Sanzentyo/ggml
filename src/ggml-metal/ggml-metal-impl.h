@@ -593,10 +593,13 @@ typedef struct {
     int32_t  KH;
     int32_t  KW;
     int32_t  OC;
+    int32_t  OH;
+    int32_t  OW;
     int32_t  s0;
     uint64_t nb0;
     uint64_t nb1;
     uint64_t nb2;
+    uint64_t nb3;
 } ggml_metal_kargs_conv_transpose_2d;
 
 typedef struct {
@@ -991,6 +994,65 @@ typedef struct {
     uint64_t nb2;
     uint64_t nb3;
 } ggml_metal_kargs_pad;
+
+typedef struct {
+    int64_t  ne00;
+    int64_t  ne01;
+    int64_t  ne02;
+    uint64_t nb00;
+    uint64_t nb01;
+    uint64_t nb02;
+    int64_t  ne0;
+    int64_t  ne1;
+    int64_t  ne2;
+    int32_t  npx;
+    int32_t  npy;
+    int32_t  w;
+} ggml_metal_kargs_win_part;
+
+typedef struct {
+    int64_t  ne00;
+    int64_t  ne01;
+    int64_t  ne02;
+    uint64_t nb00;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    int64_t  ne0;
+    int64_t  ne1;
+    int64_t  ne2;
+    int32_t  npx;
+    int32_t  w;
+} ggml_metal_kargs_win_unpart;
+
+typedef struct {
+    uint64_t nb00;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb10;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    uint64_t nb0;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+    int32_t  IW;
+    int32_t  IH;
+    int32_t  KW;
+    int32_t  KH;
+    int32_t  C;
+    int32_t  OW;
+    int32_t  OH;
+    int32_t  N;
+    int32_t  s0;
+    int32_t  s1;
+    int32_t  p0;
+    int32_t  p1;
+    int32_t  d0;
+    int32_t  d1;
+} ggml_metal_kargs_conv_2d_dw;
 
 typedef struct {
     int64_t  ne00;
