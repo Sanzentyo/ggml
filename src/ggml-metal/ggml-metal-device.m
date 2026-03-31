@@ -1751,6 +1751,7 @@ static bool ggml_metal_device_supports_flash_attn_ext_shape(const struct ggml_te
         case 32:  return dv == 32;
         case 40:  return dv == 40;
         case 48:  return dv == 48;
+        case 56:  return dv == 56;
         case 64:  return dv == 64;
         case 72:  return dv == 72;
         case 80:  return dv == 80;
@@ -1922,9 +1923,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 return false;
             }
             // for new head sizes, add checks here
-            if (op->src[0]->ne[0] != 32 &&
+            if (op->src[0]->ne[0] != 16 &&
+                op->src[0]->ne[0] != 32 &&
                 op->src[0]->ne[0] != 40 &&
                 op->src[0]->ne[0] != 48 &&
+                op->src[0]->ne[0] != 56 &&
                 op->src[0]->ne[0] != 64 &&
                 op->src[0]->ne[0] != 72 &&
                 op->src[0]->ne[0] != 80 &&
