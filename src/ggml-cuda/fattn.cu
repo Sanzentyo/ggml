@@ -328,6 +328,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const int cc = ggml_cuda_info().devices[device].cc;
 
     switch (K->ne[0]) {
+        case  16:
+        case  32:
         case  40:
         case  64:
         case  72:
@@ -382,6 +384,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+    if (Q->ne[0] == 16 || Q->ne[0] == 32) {
+        return BEST_FATTN_KERNEL_TILE;
+    }
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
@@ -489,6 +495,24 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     ggml_cuda_set_device(ctx.device);
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
+#ifdef GGML_CUDA_FATTN_DIAG
+            fprintf(stderr,
+                    "ggml_cuda_flash_attn_ext: no CUDA kernel for Q[%lld,%lld,%lld,%lld] %s "
+                    "K[%lld,%lld,%lld,%lld] %s V[%lld,%lld,%lld,%lld] %s mask=%s cc=%d highest=%d turing=%d\n",
+                    (long long) dst->src[0]->ne[0], (long long) dst->src[0]->ne[1],
+                    (long long) dst->src[0]->ne[2], (long long) dst->src[0]->ne[3],
+                    ggml_type_name(dst->src[0]->type),
+                    (long long) dst->src[1]->ne[0], (long long) dst->src[1]->ne[1],
+                    (long long) dst->src[1]->ne[2], (long long) dst->src[1]->ne[3],
+                    ggml_type_name(dst->src[1]->type),
+                    (long long) dst->src[2]->ne[0], (long long) dst->src[2]->ne[1],
+                    (long long) dst->src[2]->ne[2], (long long) dst->src[2]->ne[3],
+                    ggml_type_name(dst->src[2]->type),
+                    dst->src[3] ? "yes" : "no",
+                    ggml_cuda_info().devices[ctx.device].cc,
+                    ggml_cuda_highest_compiled_arch(ggml_cuda_info().devices[ctx.device].cc),
+                    turing_mma_available(ggml_cuda_info().devices[ctx.device].cc));
+#endif
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:
             ggml_cuda_flash_attn_ext_tile(ctx, dst);
