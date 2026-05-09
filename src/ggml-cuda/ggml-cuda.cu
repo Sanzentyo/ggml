@@ -3128,8 +3128,47 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     return use_cuda_graph;
 }
 
+static uint64_t ggml_cuda_graph_hash_u64(uint64_t h, uint64_t v) {
+    h ^= v;
+    h *= 1099511628211ULL;
+    return h;
+}
+
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+    static const bool use_shape_key = getenv("GGML_CUDA_GRAPH_SHAPE_KEY") != nullptr;
+    if (!use_shape_key) {
+        return cgraph->nodes[0];
+    }
+
+    uint64_t h = 1469598103934665603ULL;
+    h = ggml_cuda_graph_hash_u64(h, (uint64_t) cgraph->n_nodes);
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        h = ggml_cuda_graph_hash_u64(h, (uint64_t) node->op);
+        h = ggml_cuda_graph_hash_u64(h, (uint64_t) node->type);
+        h = ggml_cuda_graph_hash_u64(h, (uint64_t) node->flags);
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            h = ggml_cuda_graph_hash_u64(h, (uint64_t) node->ne[d]);
+            h = ggml_cuda_graph_hash_u64(h, (uint64_t) node->nb[d]);
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = node->src[s];
+            h = ggml_cuda_graph_hash_u64(h, src ? (uint64_t) src->op + 1 : 0);
+            if (src) {
+                h = ggml_cuda_graph_hash_u64(h, (uint64_t) src->type);
+                for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                    h = ggml_cuda_graph_hash_u64(h, (uint64_t) src->ne[d]);
+                    h = ggml_cuda_graph_hash_u64(h, (uint64_t) src->nb[d]);
+                }
+            }
+        }
+        const uint8_t * params = (const uint8_t *) node->op_params;
+        for (int p = 0; p < GGML_MAX_OP_PARAMS; ++p) {
+            h = ggml_cuda_graph_hash_u64(h, params[p]);
+        }
+    }
+    if (h == 0) h = 1;
+    return (const void *) (uintptr_t) h;
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
@@ -4262,6 +4301,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
+    static const bool use_shape_key = getenv("GGML_CUDA_GRAPH_SHAPE_KEY") != nullptr;
     const void * graph_key = nullptr;
 
 #ifdef USE_CUDA_GRAPH
@@ -4277,7 +4317,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
-                if (!properties_changed) {
+                if (!properties_changed || use_shape_key) {
                     graph->warmup_complete = true;
                     GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
                     use_cuda_graph = true;
@@ -4287,9 +4327,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             } else {
                 // Post-warmup: normal CUDA graph operation
                 if (properties_changed) {
-                    // Properties changed - reset warmup, execute directly until stable again
-                    graph->warmup_complete = false;
-                    GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
+                    if (use_shape_key) {
+                        use_cuda_graph = true;
+                        cuda_graph_update_required = true;
+                    } else {
+                        // Properties changed - reset warmup, execute directly until stable again
+                        graph->warmup_complete = false;
+                        GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
+                    }
                 } else {
                     use_cuda_graph = true;
                     cuda_graph_update_required = graph->instance == nullptr;
