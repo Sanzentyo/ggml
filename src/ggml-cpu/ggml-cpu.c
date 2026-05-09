@@ -217,6 +217,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_F16,
         .nrows                    = 1,
     },
+    [GGML_TYPE_Q1_0] = {
+        .from_float               = quantize_row_q1_0,
+        .vec_dot                  = ggml_vec_dot_q1_0_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_Q4_0] = {
         .from_float               = quantize_row_q4_0,
         .vec_dot                  = ggml_vec_dot_q4_0_q8_0,
@@ -1238,6 +1244,12 @@ void ggml_compute_forward_mul_mat(
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
+
+    const int32_t hint = ggml_get_op_params_i32(dst, 1);
+    if (hint == GGML_HINT_SRC0_IS_HADAMARD && !params->use_ref) {
+        ggml_compute_forward_fwht(params, dst);
+        return;
+    }
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -2350,11 +2362,15 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_FLASH_ATTN_BACK:
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
+            {
+                n_tasks = n_threads;
+            } break;
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_GATED_LINEAR_ATTN:
         case GGML_OP_RWKV_WKV7:
             {
-                n_tasks = n_threads;
+                const int64_t n_heads = node->src[1]->ne[1];
+                n_tasks = MIN(n_threads, n_heads);
             } break;
         case GGML_OP_WIN_PART:
         case GGML_OP_WIN_UNPART:
