@@ -4072,6 +4072,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
+    const bool profile_nodes = getenv("GGML_CUDA_PROFILE_NODES") != nullptr;
+    cudaEvent_t profile_start = nullptr;
+    cudaEvent_t profile_stop  = nullptr;
+    if (profile_nodes) {
+        CUDA_CHECK(cudaEventCreate(&profile_start));
+        CUDA_CHECK(cudaEventCreate(&profile_stop));
+    }
 
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
@@ -4216,9 +4223,31 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                if (profile_nodes) {
+                    CUDA_CHECK(cudaEventRecord(profile_start, cuda_ctx->stream()));
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    if (profile_nodes) {
+                        CUDA_CHECK(cudaEventRecord(profile_stop, cuda_ctx->stream()));
+                        CUDA_CHECK(cudaEventSynchronize(profile_stop));
+                        float ms = 0.0f;
+                        CUDA_CHECK(cudaEventElapsedTime(&ms, profile_start, profile_stop));
+                        fprintf(stderr,
+                                "GGML_CUDA_PROFILE_NODE fused=1 skipped=%d op=%s name=%s ms=%.6f "
+                                "dst_type=%s dst_ne=%lld,%lld,%lld,%lld\n",
+                                nodes_to_skip,
+                                ggml_op_name(node->op),
+                                node->name,
+                                ms,
+                                ggml_type_name(node->type),
+                                (long long) node->ne[0],
+                                (long long) node->ne[1],
+                                (long long) node->ne[2],
+                                (long long) node->ne[3]);
+                    }
                     i += nodes_to_skip;
                     continue;
                 }
@@ -4241,9 +4270,41 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
                 GGML_ASSERT(ok);
 
+                if (profile_nodes) {
+                    CUDA_CHECK(cudaEventRecord(profile_stop, cuda_ctx->stream()));
+                    CUDA_CHECK(cudaEventSynchronize(profile_stop));
+                    float ms = 0.0f;
+                    CUDA_CHECK(cudaEventElapsedTime(&ms, profile_start, profile_stop));
+                    const ggml_tensor * src0 = node->src[0];
+                    const ggml_tensor * src1 = node->src[1];
+                    fprintf(stderr,
+                            "GGML_CUDA_PROFILE_NODE fused=0 skipped=0 op=%s name=%s ms=%.6f "
+                            "dst_type=%s dst_ne=%lld,%lld,%lld,%lld "
+                            "src0_type=%s src0_ne=%lld,%lld,%lld,%lld "
+                            "src1_type=%s src1_ne=%lld,%lld,%lld,%lld\n",
+                            ggml_op_name(node->op),
+                            node->name,
+                            ms,
+                            ggml_type_name(node->type),
+                            (long long) node->ne[0],
+                            (long long) node->ne[1],
+                            (long long) node->ne[2],
+                            (long long) node->ne[3],
+                            src0 ? ggml_type_name(src0->type) : "none",
+                            src0 ? (long long) src0->ne[0] : 0LL,
+                            src0 ? (long long) src0->ne[1] : 0LL,
+                            src0 ? (long long) src0->ne[2] : 0LL,
+                            src0 ? (long long) src0->ne[3] : 0LL,
+                            src1 ? ggml_type_name(src1->type) : "none",
+                            src1 ? (long long) src1->ne[0] : 0LL,
+                            src1 ? (long long) src1->ne[1] : 0LL,
+                            src1 ? (long long) src1->ne[2] : 0LL,
+                            src1 ? (long long) src1->ne[3] : 0LL);
+                }
+
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
-               }
+                }
             }
         }
 
@@ -4281,6 +4342,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
 #endif  // USE_CUDA_GRAPH
+    }
+
+    if (profile_nodes) {
+        CUDA_CHECK(cudaEventDestroy(profile_start));
+        CUDA_CHECK(cudaEventDestroy(profile_stop));
     }
 }
 
@@ -4350,6 +4416,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
     }
 #endif // USE_CUDA_GRAPH
+
+    if (getenv("GGML_CUDA_PROFILE_NODES") != nullptr) {
+        use_cuda_graph = false;
+        cuda_graph_update_required = false;
+    }
 
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
