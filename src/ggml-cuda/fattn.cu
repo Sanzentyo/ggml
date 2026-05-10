@@ -31,6 +31,31 @@ static __global__ void fattn_pad_head56_to64_f32(
     dst[i] = d < 56 ? src[d + i1*s1 + i2*s2 + i3*s3] : 0.0f;
 }
 
+static __global__ void fattn_pad_head56_to64_f16(
+        const float * __restrict__ src,
+        half        * __restrict__ dst,
+        const int64_t ne1,
+        const int64_t ne2,
+        const int64_t ne3,
+        const int64_t s1,
+        const int64_t s2,
+        const int64_t s3) {
+    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    const int64_t n = 64*ne1*ne2*ne3;
+    if (i >= n) {
+        return;
+    }
+
+    const int64_t d = i % 64;
+    const int64_t t = i / 64;
+    const int64_t i1 = t % ne1;
+    const int64_t t2 = t / ne1;
+    const int64_t i2 = t2 % ne2;
+    const int64_t i3 = t2 / ne2;
+
+    dst[i] = d < 56 ? __float2half(src[d + i1*s1 + i2*s2 + i3*s3]) : __float2half(0.0f);
+}
+
 static __global__ void fattn_slice_head64_to56_f32(
         const float * __restrict__ src,
         float       * __restrict__ dst,
@@ -277,11 +302,24 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     }
 }
 
-static void fattn_make_contiguous_f32_tensor(ggml_tensor & tensor, float * data) {
+static void fattn_make_contiguous_f32_head64_tensor(ggml_tensor & tensor, float * data) {
+    tensor.type = GGML_TYPE_F32;
     tensor.data = data;
     tensor.ne[0] = 64;
     tensor.nb[0] = sizeof(float);
     tensor.nb[1] = 64*sizeof(float);
+    tensor.nb[2] = tensor.ne[1]*tensor.nb[1];
+    tensor.nb[3] = tensor.ne[2]*tensor.nb[2];
+    tensor.view_src = nullptr;
+    tensor.view_offs = 0;
+}
+
+static void fattn_make_contiguous_f16_head64_tensor(ggml_tensor & tensor, half * data) {
+    tensor.type = GGML_TYPE_F16;
+    tensor.data = data;
+    tensor.ne[0] = 64;
+    tensor.nb[0] = sizeof(half);
+    tensor.nb[1] = 64*sizeof(half);
     tensor.nb[2] = tensor.ne[1]*tensor.nb[1];
     tensor.nb[3] = tensor.ne[2]*tensor.nb[2];
     tensor.view_src = nullptr;
@@ -306,13 +344,13 @@ static void ggml_cuda_flash_attn_ext_head56_pad_mma_f16(ggml_backend_cuda_contex
 
     ggml_cuda_pool & pool = ctx.pool();
     ggml_cuda_pool_alloc<float> Q_pad(pool, 64*Q->ne[1]*Q->ne[2]*Q->ne[3]);
-    ggml_cuda_pool_alloc<float> K_pad(pool, 64*K->ne[1]*K->ne[2]*K->ne[3]);
-    ggml_cuda_pool_alloc<float> V_pad(pool, 64*V->ne[1]*V->ne[2]*V->ne[3]);
+    ggml_cuda_pool_alloc<half>  K_pad(pool, 64*K->ne[1]*K->ne[2]*K->ne[3]);
+    ggml_cuda_pool_alloc<half>  V_pad(pool, 64*V->ne[1]*V->ne[2]*V->ne[3]);
     ggml_cuda_pool_alloc<float> dst_pad(pool, 64*dst->ne[1]*dst->ne[2]*dst->ne[3]);
 
     constexpr int block_size = 256;
     cudaStream_t stream = ctx.stream();
-    auto launch_pad = [&](const ggml_tensor * src, float * tmp) {
+    auto launch_pad_f32 = [&](const ggml_tensor * src, float * tmp) {
         const int64_t n = 64*src->ne[1]*src->ne[2]*src->ne[3];
         const int grid_size = (n + block_size - 1) / block_size;
         fattn_pad_head56_to64_f32<<<grid_size, block_size, 0, stream>>>(
@@ -322,19 +360,29 @@ static void ggml_cuda_flash_attn_ext_head56_pad_mma_f16(ggml_backend_cuda_contex
                 src->nb[2] / sizeof(float),
                 src->nb[3] / sizeof(float));
     };
+    auto launch_pad_f16 = [&](const ggml_tensor * src, half * tmp) {
+        const int64_t n = 64*src->ne[1]*src->ne[2]*src->ne[3];
+        const int grid_size = (n + block_size - 1) / block_size;
+        fattn_pad_head56_to64_f16<<<grid_size, block_size, 0, stream>>>(
+                (const float *) src->data, tmp,
+                src->ne[1], src->ne[2], src->ne[3],
+                src->nb[1] / sizeof(float),
+                src->nb[2] / sizeof(float),
+                src->nb[3] / sizeof(float));
+    };
 
-    launch_pad(Q, Q_pad.ptr);
-    launch_pad(K, K_pad.ptr);
-    launch_pad(V, V_pad.ptr);
+    launch_pad_f32(Q, Q_pad.ptr);
+    launch_pad_f16(K, K_pad.ptr);
+    launch_pad_f16(V, V_pad.ptr);
 
     ggml_tensor Q64 = *Q;
     ggml_tensor K64 = *K;
     ggml_tensor V64 = *V;
     ggml_tensor dst64 = *dst;
-    fattn_make_contiguous_f32_tensor(Q64, Q_pad.ptr);
-    fattn_make_contiguous_f32_tensor(K64, K_pad.ptr);
-    fattn_make_contiguous_f32_tensor(V64, V_pad.ptr);
-    fattn_make_contiguous_f32_tensor(dst64, dst_pad.ptr);
+    fattn_make_contiguous_f32_head64_tensor(Q64, Q_pad.ptr);
+    fattn_make_contiguous_f16_head64_tensor(K64, K_pad.ptr);
+    fattn_make_contiguous_f16_head64_tensor(V64, V_pad.ptr);
+    fattn_make_contiguous_f32_head64_tensor(dst64, dst_pad.ptr);
     dst64.src[0] = &Q64;
     dst64.src[1] = &K64;
     dst64.src[2] = &V64;
