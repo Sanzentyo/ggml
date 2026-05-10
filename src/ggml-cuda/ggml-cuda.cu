@@ -3142,7 +3142,7 @@ static uint64_t ggml_cuda_graph_hash_u64(uint64_t h, uint64_t v) {
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    static const bool use_shape_key = getenv("GGML_CUDA_GRAPH_SHAPE_KEY") != nullptr;
+    static const bool use_shape_key = getenv("GGML_CUDA_GRAPH_PTR_KEY") == nullptr;
     if (!use_shape_key) {
         return cgraph->nodes[0];
     }
@@ -4308,7 +4308,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
-    static const bool use_shape_key = getenv("GGML_CUDA_GRAPH_SHAPE_KEY") != nullptr;
+    static const bool use_shape_key = getenv("GGML_CUDA_GRAPH_PTR_KEY") == nullptr;
     const void * graph_key = nullptr;
 
 #ifdef USE_CUDA_GRAPH
