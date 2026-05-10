@@ -1349,6 +1349,7 @@ void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor 
 extern DECL_FATTN_TILE_CASE( 16,  16);
 extern DECL_FATTN_TILE_CASE( 32,  32);
 extern DECL_FATTN_TILE_CASE( 40,  40);
+extern DECL_FATTN_TILE_CASE( 56,  56);
 extern DECL_FATTN_TILE_CASE( 64,  64);
 extern DECL_FATTN_TILE_CASE( 72,  72);
 extern DECL_FATTN_TILE_CASE( 80,  80);

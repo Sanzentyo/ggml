@@ -3,7 +3,8 @@
 from glob import glob
 import os
 
-HEAD_SIZES_KQ = [40, 56, 64, 72, 80, 96, 112, 128, 256, 320, 512, 576]
+HEAD_SIZES_TILE_KQ = [16, 32, 40, 56, 64, 72, 80, 96, 112, 128, 256, 320, 512, 576]
+HEAD_SIZES_MMA_KQ = [40, 64, 72, 80, 96, 112, 128, 256, 320, 512, 576]
 
 TYPES_KV = ["GGML_TYPE_F16", "GGML_TYPE_Q4_0", "GGML_TYPE_Q4_1", "GGML_TYPE_Q5_0", "GGML_TYPE_Q5_1", "GGML_TYPE_Q8_0", "GGML_TYPE_BF16"]
 
@@ -61,7 +62,7 @@ def get_short_name(long_quant_name):
 for filename in glob("*.cu"):
     os.remove(filename)
 
-for head_size_kq in HEAD_SIZES_KQ:
+for head_size_kq in HEAD_SIZES_TILE_KQ:
     head_size_v = 256 if head_size_kq == 320 else (head_size_kq if head_size_kq != 576 else 512)
     with open(f"fattn-tile-instance-dkq{head_size_kq}-dv{head_size_v}.cu", "w") as f:
         f.write(SOURCE_FATTN_TILE.format(head_size_kq=head_size_kq, head_size_v=head_size_v))
@@ -79,10 +80,8 @@ for ncols in [8, 16, 32, 64]:
         with open(f"fattn-mma-f16-instance-ncols1_{ncols1}-ncols2_{ncols2}.cu", "w") as f:
             f.write(SOURCE_FATTN_MMA_START)
 
-            for head_size_kq in HEAD_SIZES_KQ:
+            for head_size_kq in HEAD_SIZES_MMA_KQ:
                 if head_size_kq == 40:
-                    continue
-                if head_size_kq == 56:
                     continue
                 if head_size_kq == 72:
                     continue
