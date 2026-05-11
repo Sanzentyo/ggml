@@ -1,4 +1,5 @@
 #include "binbcast.cuh"
+#include "unary.cuh"
 #include <cstdint>
 #include <utility>
 
@@ -9,6 +10,24 @@ static __device__ __forceinline__ float op_repeat(const float a, const float b) 
 
 static __device__ __forceinline__ float op_add(const float a, const float b) {
     return a + b;
+}
+
+static __device__ __forceinline__ float op_add_gelu(const float a, const float b) {
+    return ggml_cuda_op_gelu_single(a + b);
+}
+
+static __device__ __forceinline__ float op_add_gelu_erf(const float a, const float b) {
+    const float SQRT_2_INV = 0.70710678118654752440084436210484f;
+    const float x = a + b;
+
+    return 0.5f*x*(1.0f + erff(x*SQRT_2_INV));
+}
+
+static __device__ __forceinline__ float op_add_gelu_quick(const float a, const float b) {
+    const float GELU_QUICK_COEF = -1.702f;
+    const float x = a + b;
+
+    return x * (1.0f / (1.0f + expf(GELU_QUICK_COEF * x)));
 }
 
 static __device__ __forceinline__ float op_sub(const float a, const float b) {
@@ -396,6 +415,40 @@ void ggml_cuda_op_repeat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
 void ggml_cuda_op_add(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_add>>(dst->src[0], dst->src[1], dst, dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
+}
+
+template <float (*op)(const float, const float)>
+static void ggml_cuda_op_add_unary_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * add, ggml_tensor * unary) {
+    const ggml_tensor * src0 = add->src[0];
+    const ggml_tensor * src1 = add->src[1];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(add->type == GGML_TYPE_F32);
+    GGML_ASSERT(unary->type == GGML_TYPE_F32);
+
+    ggml_tensor fused = *add;
+    fused.data = unary->data;
+
+    launch_bin_bcast_pack<op, float, float, float>(
+        src0, src1, &fused, (const float *) src0->data, (const float *) src1->data, (float *) unary->data,
+        ctx.stream(), std::make_index_sequence<1>{});
+}
+
+void ggml_cuda_op_add_unary(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * unary) {
+    switch (ggml_get_unary_op(unary)) {
+        case GGML_UNARY_OP_GELU:
+            ggml_cuda_op_add_unary_impl<op_add_gelu>(ctx, add, unary);
+            break;
+        case GGML_UNARY_OP_GELU_ERF:
+            ggml_cuda_op_add_unary_impl<op_add_gelu_erf>(ctx, add, unary);
+            break;
+        case GGML_UNARY_OP_GELU_QUICK:
+            ggml_cuda_op_add_unary_impl<op_add_gelu_quick>(ctx, add, unary);
+            break;
+        default:
+            GGML_ABORT("unsupported add+unary fusion");
+    }
 }
 
 void ggml_cuda_op_sub(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

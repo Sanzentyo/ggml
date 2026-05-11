@@ -3615,6 +3615,25 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return true;
     }
 
+    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_ADD && ops.begin()[1] == GGML_OP_UNARY
+     && unary_ops.size() == 1 && (unary_ops.begin()[0] == GGML_UNARY_OP_GELU ||
+                                  unary_ops.begin()[0] == GGML_UNARY_OP_GELU_ERF ||
+                                  unary_ops.begin()[0] == GGML_UNARY_OP_GELU_QUICK)) {
+        const ggml_tensor * add   = cgraph->nodes[node_idx];
+        const ggml_tensor * unary = cgraph->nodes[node_idx+1];
+
+        if (ggml_get_unary_op(unary) != unary_ops.begin()[0]) {
+            return false;
+        }
+
+        if (add->type != GGML_TYPE_F32 || unary->type != GGML_TYPE_F32 ||
+            add->src[0]->type != GGML_TYPE_F32 || add->src[1]->type != GGML_TYPE_F32) {
+            return false;
+        }
+
+        return true;
+    }
+
     if (ops.size() == 3 && ops.begin()[0] == GGML_OP_SSM_CONV && ops.begin()[1] == GGML_OP_ADD
      && ops.begin()[2] == GGML_OP_UNARY && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SILU) {
         const ggml_tensor * ssm_conv = cgraph->nodes[node_idx];
@@ -4141,6 +4160,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
         ggml_cuda_op_ssm_conv(*cuda_ctx, node, /*bias_add_node=*/ nullptr, cgraph->nodes[i + 1]);
+        return 1;
+    }
+
+    static const bool disable_add_unary_fusion =
+        getenv("GGML_CUDA_DISABLE_ADD_UNARY_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_ADD_UNARY_FUSION"));
+
+    if (!disable_add_unary_fusion &&
+        (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_UNARY }, { GGML_UNARY_OP_GELU }) ||
+         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_UNARY }, { GGML_UNARY_OP_GELU_ERF }) ||
+         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_UNARY }, { GGML_UNARY_OP_GELU_QUICK }))) {
+        ggml_cuda_op_add_unary(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
     }
 
