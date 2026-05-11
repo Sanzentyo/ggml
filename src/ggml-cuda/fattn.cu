@@ -99,6 +99,33 @@ static __global__ void fattn_pad_head56_to64_q_f32_kv_f16(
     }
 }
 
+static __global__ void fattn_pad_head56_to64_q_f32_kv_f16_contiguous(
+        const float * __restrict__ Q,
+        const float * __restrict__ K,
+        const float * __restrict__ V,
+        float       * __restrict__ Q_dst,
+        half        * __restrict__ K_dst,
+        half        * __restrict__ V_dst,
+        const int64_t n) {
+    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+
+    const int64_t d = i & 63;
+    const int64_t t = i >> 6;
+    if (d < 56) {
+        const int64_t src_i = d + 56*t;
+        Q_dst[i] = Q[src_i];
+        K_dst[i] = __float2half(K[src_i]);
+        V_dst[i] = __float2half(V[src_i]);
+    } else {
+        Q_dst[i] = 0.0f;
+        K_dst[i] = __float2half(0.0f);
+        V_dst[i] = __float2half(0.0f);
+    }
+}
+
 static __global__ void fattn_slice_head64_to56_f32(
         const float * __restrict__ src,
         float       * __restrict__ dst,
@@ -122,6 +149,20 @@ static __global__ void fattn_slice_head64_to56_f32(
     const int64_t i3 = t2 / ne2;
 
     dst[d + i1*s1 + i2*s2 + i3*s3] = src[d + 64*(i1 + ne1*(i2 + ne2*i3))];
+}
+
+static __global__ void fattn_slice_head64_to56_f32_contiguous(
+        const float * __restrict__ src,
+        float       * __restrict__ dst,
+        const int64_t n) {
+    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+
+    const int64_t d = i % 56;
+    const int64_t t = i / 56;
+    dst[i] = src[d + 64*t];
 }
 
 static void ggml_cuda_flash_attn_ext_head56_pad_mma_f16(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
@@ -420,21 +461,33 @@ static void ggml_cuda_flash_attn_ext_head56_pad_mma_f16(ggml_backend_cuda_contex
     if (same_qkv_shape && getenv("GGML_CUDA_DISABLE_FATTN56_COMBINED_PACK") == nullptr) {
         const int64_t n = 64*Q->ne[1]*Q->ne[2]*Q->ne[3];
         const int grid_size = (n + block_size - 1) / block_size;
-        fattn_pad_head56_to64_q_f32_kv_f16<<<grid_size, block_size, 0, stream>>>(
-                (const float *) Q->data,
-                (const float *) K->data,
-                (const float *) V->data,
-                Q_pad.ptr, K_pad.ptr, V_pad.ptr,
-                Q->ne[1], Q->ne[2], Q->ne[3],
-                Q->nb[1] / sizeof(float),
-                Q->nb[2] / sizeof(float),
-                Q->nb[3] / sizeof(float),
-                K->nb[1] / sizeof(float),
-                K->nb[2] / sizeof(float),
-                K->nb[3] / sizeof(float),
-                V->nb[1] / sizeof(float),
-                V->nb[2] / sizeof(float),
-                V->nb[3] / sizeof(float));
+        const bool use_contiguous_pack =
+            getenv("GGML_CUDA_DISABLE_FATTN56_CONTIGUOUS_PACK") == nullptr &&
+            ggml_is_contiguous(Q) && ggml_is_contiguous(K) && ggml_is_contiguous(V);
+        if (use_contiguous_pack) {
+            fattn_pad_head56_to64_q_f32_kv_f16_contiguous<<<grid_size, block_size, 0, stream>>>(
+                    (const float *) Q->data,
+                    (const float *) K->data,
+                    (const float *) V->data,
+                    Q_pad.ptr, K_pad.ptr, V_pad.ptr,
+                    n);
+        } else {
+            fattn_pad_head56_to64_q_f32_kv_f16<<<grid_size, block_size, 0, stream>>>(
+                    (const float *) Q->data,
+                    (const float *) K->data,
+                    (const float *) V->data,
+                    Q_pad.ptr, K_pad.ptr, V_pad.ptr,
+                    Q->ne[1], Q->ne[2], Q->ne[3],
+                    Q->nb[1] / sizeof(float),
+                    Q->nb[2] / sizeof(float),
+                    Q->nb[3] / sizeof(float),
+                    K->nb[1] / sizeof(float),
+                    K->nb[2] / sizeof(float),
+                    K->nb[3] / sizeof(float),
+                    V->nb[1] / sizeof(float),
+                    V->nb[2] / sizeof(float),
+                    V->nb[3] / sizeof(float));
+        }
     } else {
         launch_pad_f32(Q, Q_pad.ptr);
         launch_pad_f16(K, K_pad.ptr);
@@ -459,12 +512,17 @@ static void ggml_cuda_flash_attn_ext_head56_pad_mma_f16(ggml_backend_cuda_contex
 
     const int64_t n = 56*dst->ne[1]*dst->ne[2]*dst->ne[3];
     const int grid_size = (n + block_size - 1) / block_size;
-    fattn_slice_head64_to56_f32<<<grid_size, block_size, 0, stream>>>(
-            dst_pad.ptr, (float *) dst->data,
-            dst->ne[1], dst->ne[2], dst->ne[3],
-            dst->nb[1] / sizeof(float),
-            dst->nb[2] / sizeof(float),
-            dst->nb[3] / sizeof(float));
+    if (getenv("GGML_CUDA_DISABLE_FATTN56_CONTIGUOUS_PACK") == nullptr && ggml_is_contiguous(dst)) {
+        fattn_slice_head64_to56_f32_contiguous<<<grid_size, block_size, 0, stream>>>(
+                dst_pad.ptr, (float *) dst->data, n);
+    } else {
+        fattn_slice_head64_to56_f32<<<grid_size, block_size, 0, stream>>>(
+                dst_pad.ptr, (float *) dst->data,
+                dst->ne[1], dst->ne[2], dst->ne[3],
+                dst->nb[1] / sizeof(float),
+                dst->nb[2] / sizeof(float),
+                dst->nb[3] / sizeof(float));
+    }
 }
 
 #define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \
