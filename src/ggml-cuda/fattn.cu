@@ -56,6 +56,49 @@ static __global__ void fattn_pad_head56_to64_f16(
     dst[i] = d < 56 ? __float2half(src[d + i1*s1 + i2*s2 + i3*s3]) : __float2half(0.0f);
 }
 
+static __global__ void fattn_pad_head56_to64_q_f32_kv_f16(
+        const float * __restrict__ Q,
+        const float * __restrict__ K,
+        const float * __restrict__ V,
+        float       * __restrict__ Q_dst,
+        half        * __restrict__ K_dst,
+        half        * __restrict__ V_dst,
+        const int64_t ne1,
+        const int64_t ne2,
+        const int64_t ne3,
+        const int64_t q_s1,
+        const int64_t q_s2,
+        const int64_t q_s3,
+        const int64_t k_s1,
+        const int64_t k_s2,
+        const int64_t k_s3,
+        const int64_t v_s1,
+        const int64_t v_s2,
+        const int64_t v_s3) {
+    const int64_t i = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    const int64_t n = 64*ne1*ne2*ne3;
+    if (i >= n) {
+        return;
+    }
+
+    const int64_t d = i % 64;
+    const int64_t t = i / 64;
+    const int64_t i1 = t % ne1;
+    const int64_t t2 = t / ne1;
+    const int64_t i2 = t2 % ne2;
+    const int64_t i3 = t2 / ne2;
+
+    if (d < 56) {
+        Q_dst[i] = Q[d + i1*q_s1 + i2*q_s2 + i3*q_s3];
+        K_dst[i] = __float2half(K[d + i1*k_s1 + i2*k_s2 + i3*k_s3]);
+        V_dst[i] = __float2half(V[d + i1*v_s1 + i2*v_s2 + i3*v_s3]);
+    } else {
+        Q_dst[i] = 0.0f;
+        K_dst[i] = __float2half(0.0f);
+        V_dst[i] = __float2half(0.0f);
+    }
+}
+
 static __global__ void fattn_slice_head64_to56_f32(
         const float * __restrict__ src,
         float       * __restrict__ dst,
@@ -371,9 +414,32 @@ static void ggml_cuda_flash_attn_ext_head56_pad_mma_f16(ggml_backend_cuda_contex
                 src->nb[3] / sizeof(float));
     };
 
-    launch_pad_f32(Q, Q_pad.ptr);
-    launch_pad_f16(K, K_pad.ptr);
-    launch_pad_f16(V, V_pad.ptr);
+    const bool same_qkv_shape = Q->ne[1] == K->ne[1] && Q->ne[1] == V->ne[1] &&
+                                Q->ne[2] == K->ne[2] && Q->ne[2] == V->ne[2] &&
+                                Q->ne[3] == K->ne[3] && Q->ne[3] == V->ne[3];
+    if (same_qkv_shape && getenv("GGML_CUDA_DISABLE_FATTN56_COMBINED_PACK") == nullptr) {
+        const int64_t n = 64*Q->ne[1]*Q->ne[2]*Q->ne[3];
+        const int grid_size = (n + block_size - 1) / block_size;
+        fattn_pad_head56_to64_q_f32_kv_f16<<<grid_size, block_size, 0, stream>>>(
+                (const float *) Q->data,
+                (const float *) K->data,
+                (const float *) V->data,
+                Q_pad.ptr, K_pad.ptr, V_pad.ptr,
+                Q->ne[1], Q->ne[2], Q->ne[3],
+                Q->nb[1] / sizeof(float),
+                Q->nb[2] / sizeof(float),
+                Q->nb[3] / sizeof(float),
+                K->nb[1] / sizeof(float),
+                K->nb[2] / sizeof(float),
+                K->nb[3] / sizeof(float),
+                V->nb[1] / sizeof(float),
+                V->nb[2] / sizeof(float),
+                V->nb[3] / sizeof(float));
+    } else {
+        launch_pad_f32(Q, Q_pad.ptr);
+        launch_pad_f16(K, K_pad.ptr);
+        launch_pad_f16(V, V_pad.ptr);
+    }
 
     ggml_tensor Q64 = *Q;
     ggml_tensor K64 = *K;
