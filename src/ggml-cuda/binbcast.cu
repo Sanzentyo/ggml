@@ -204,6 +204,19 @@ static __global__ void k_bin_bcast_axis_f32(const float * __restrict__ src0,
     dst[i] = bin_op(src0[i], src1[i_src1]);
 }
 
+template <float (*bin_op)(const float, const float), typename src0_t, typename src1_t, typename dst_t>
+static __global__ void k_bin_contiguous(const src0_t * __restrict__ src0,
+                                        const src1_t * __restrict__ src1,
+                                        dst_t * __restrict__ dst,
+                                        const int64_t total) {
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+    if (i >= total) {
+        return;
+    }
+
+    dst[i] = (dst_t) bin_op((float) src0[i], (float) src1[i]);
+}
+
 static int ggml_cuda_get_bin_bcast_axis_f32(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return -1;
@@ -253,6 +266,34 @@ static bool ggml_cuda_try_bin_bcast_axis_f32(const ggml_tensor * src0,
     k_bin_bcast_axis_f32<bin_op><<<blocks, block_size, 0, stream>>>(
         (const float *) src0->data, (const float *) src1->data, (float *) dst->data,
         total, dst->ne[0], dst->ne[1], dst->ne[2], axis);
+    return true;
+}
+
+template <float (*bin_op)(const float, const float), typename src0_t, typename src1_t, typename dst_t>
+static bool ggml_cuda_try_bin_contiguous(const ggml_tensor * src0,
+                                         const ggml_tensor * src1,
+                                         ggml_tensor * dst,
+                                         const src0_t * src0_dd,
+                                         const src1_t * src1_dd,
+                                         dst_t * dst_dd,
+                                         cudaStream_t stream) {
+    static const bool disabled =
+        std::getenv("GGML_CUDA_DISABLE_BIN_CONTIGUOUS_FAST") != nullptr &&
+        std::atoi(std::getenv("GGML_CUDA_DISABLE_BIN_CONTIGUOUS_FAST"));
+    if (disabled) {
+        return false;
+    }
+    if (!ggml_are_same_shape(src0, src1) || !ggml_are_same_shape(src0, dst)) {
+        return false;
+    }
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+
+    const int64_t total = ggml_nelements(dst);
+    const int block_size = 256;
+    const int blocks = (total + block_size - 1) / block_size;
+    k_bin_contiguous<bin_op><<<blocks, block_size, 0, stream>>>(src0_dd, src1_dd, dst_dd, total);
     return true;
 }
 
@@ -456,6 +497,9 @@ struct bin_bcast_cuda {
     void operator()(const struct ggml_tensor * src0, const struct ggml_tensor * src1, struct ggml_tensor * dst,
             const src0_t * src0_dd, const src1_t * src1_dd, dst_t * dst_dd,
             cudaStream_t stream) {
+        if (src0 != nullptr && ggml_cuda_try_bin_contiguous<bin_op>(src0, src1, dst, src0_dd, src1_dd, dst_dd, stream)) {
+            return;
+        }
         launch_bin_bcast_pack<bin_op, src0_t, src1_t, dst_t>(
             src0, src1, dst, src0_dd, src1_dd, dst_dd, stream, std::make_index_sequence<n_fuse>{});
     }
