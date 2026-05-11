@@ -4541,7 +4541,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
-    if (getenv("GGML_CUDA_PROFILE_NODES") != nullptr) {
+    if (getenv("GGML_CUDA_PROFILE_NODES") != nullptr || getenv("GGML_CUDA_PROFILE_FATTN56") != nullptr) {
         use_cuda_graph = false;
         cuda_graph_update_required = false;
     }

@@ -434,6 +434,19 @@ static void ggml_cuda_flash_attn_ext_head56_pad_mma_f16(ggml_backend_cuda_contex
 
     constexpr int block_size = 256;
     cudaStream_t stream = ctx.stream();
+    const bool profile_fattn56 = getenv("GGML_CUDA_PROFILE_FATTN56") != nullptr;
+    cudaEvent_t profile_start = nullptr;
+    cudaEvent_t profile_after_pack = nullptr;
+    cudaEvent_t profile_after_mma = nullptr;
+    cudaEvent_t profile_after_slice = nullptr;
+    if (profile_fattn56) {
+        CUDA_CHECK(cudaEventCreate(&profile_start));
+        CUDA_CHECK(cudaEventCreate(&profile_after_pack));
+        CUDA_CHECK(cudaEventCreate(&profile_after_mma));
+        CUDA_CHECK(cudaEventCreate(&profile_after_slice));
+        CUDA_CHECK(cudaEventRecord(profile_start, stream));
+    }
+
     auto launch_pad_f32 = [&](const ggml_tensor * src, float * tmp) {
         const int64_t n = 64*src->ne[1]*src->ne[2]*src->ne[3];
         const int grid_size = (n + block_size - 1) / block_size;
@@ -493,6 +506,9 @@ static void ggml_cuda_flash_attn_ext_head56_pad_mma_f16(ggml_backend_cuda_contex
         launch_pad_f16(K, K_pad.ptr);
         launch_pad_f16(V, V_pad.ptr);
     }
+    if (profile_fattn56) {
+        CUDA_CHECK(cudaEventRecord(profile_after_pack, stream));
+    }
 
     ggml_tensor Q64 = *Q;
     ggml_tensor K64 = *K;
@@ -509,6 +525,9 @@ static void ggml_cuda_flash_attn_ext_head56_pad_mma_f16(ggml_backend_cuda_contex
     dst64.src[4] = nullptr;
 
     ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<64, 64>(ctx, &dst64);
+    if (profile_fattn56) {
+        CUDA_CHECK(cudaEventRecord(profile_after_mma, stream));
+    }
 
     const int64_t n = 56*dst->ne[1]*dst->ne[2]*dst->ne[3];
     const int grid_size = (n + block_size - 1) / block_size;
@@ -522,6 +541,60 @@ static void ggml_cuda_flash_attn_ext_head56_pad_mma_f16(ggml_backend_cuda_contex
                 dst->nb[1] / sizeof(float),
                 dst->nb[2] / sizeof(float),
                 dst->nb[3] / sizeof(float));
+    }
+    if (profile_fattn56) {
+        CUDA_CHECK(cudaEventRecord(profile_after_slice, stream));
+        CUDA_CHECK(cudaEventSynchronize(profile_after_slice));
+
+        float pack_ms = 0.0f;
+        float mma_ms = 0.0f;
+        float slice_ms = 0.0f;
+        float total_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&pack_ms, profile_start, profile_after_pack));
+        CUDA_CHECK(cudaEventElapsedTime(&mma_ms, profile_after_pack, profile_after_mma));
+        CUDA_CHECK(cudaEventElapsedTime(&slice_ms, profile_after_mma, profile_after_slice));
+        CUDA_CHECK(cudaEventElapsedTime(&total_ms, profile_start, profile_after_slice));
+        fprintf(stderr,
+                "GGML_CUDA_PROFILE_FATTN56 pack_ms=%.6f mma_ms=%.6f slice_ms=%.6f total_ms=%.6f "
+                "Q=[%lld,%lld,%lld,%lld] q_nb=[%lld,%lld,%lld,%lld] "
+                "K=[%lld,%lld,%lld,%lld] k_nb=[%lld,%lld,%lld,%lld] "
+                "V=[%lld,%lld,%lld,%lld] v_nb=[%lld,%lld,%lld,%lld] "
+                "qkv_contiguous=%d dst_contiguous=%d combined=%d\n",
+                pack_ms,
+                mma_ms,
+                slice_ms,
+                total_ms,
+                (long long) Q->ne[0],
+                (long long) Q->ne[1],
+                (long long) Q->ne[2],
+                (long long) Q->ne[3],
+                (long long) Q->nb[0],
+                (long long) Q->nb[1],
+                (long long) Q->nb[2],
+                (long long) Q->nb[3],
+                (long long) K->ne[0],
+                (long long) K->ne[1],
+                (long long) K->ne[2],
+                (long long) K->ne[3],
+                (long long) K->nb[0],
+                (long long) K->nb[1],
+                (long long) K->nb[2],
+                (long long) K->nb[3],
+                (long long) V->ne[0],
+                (long long) V->ne[1],
+                (long long) V->ne[2],
+                (long long) V->ne[3],
+                (long long) V->nb[0],
+                (long long) V->nb[1],
+                (long long) V->nb[2],
+                (long long) V->nb[3],
+                ggml_is_contiguous(Q) && ggml_is_contiguous(K) && ggml_is_contiguous(V),
+                ggml_is_contiguous(dst),
+                same_qkv_shape && getenv("GGML_CUDA_DISABLE_FATTN56_COMBINED_PACK") == nullptr);
+        CUDA_CHECK(cudaEventDestroy(profile_start));
+        CUDA_CHECK(cudaEventDestroy(profile_after_pack));
+        CUDA_CHECK(cudaEventDestroy(profile_after_mma));
+        CUDA_CHECK(cudaEventDestroy(profile_after_slice));
     }
 }
 
