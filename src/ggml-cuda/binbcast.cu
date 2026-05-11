@@ -1,5 +1,6 @@
 #include "binbcast.cuh"
 #include "unary.cuh"
+#include <cstdlib>
 #include <cstdint>
 #include <utility>
 
@@ -168,6 +169,91 @@ static __global__ void k_bin_bcast_unravel(const src0_t *         src0,
     }
 
     dst_row[i0] = (dst_t) result;
+}
+
+template <float (*bin_op)(const float, const float)>
+static __global__ void k_bin_bcast_axis_f32(const float * __restrict__ src0,
+                                            const float * __restrict__ src1,
+                                            float * __restrict__ dst,
+                                            const int64_t total,
+                                            const int64_t ne0,
+                                            const int64_t ne1,
+                                            const int64_t ne2,
+                                            const int axis) {
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+    if (i >= total) {
+        return;
+    }
+
+    int64_t i_src1;
+    switch (axis) {
+        case 0:
+            i_src1 = i % ne0;
+            break;
+        case 1:
+            i_src1 = (i / ne0) % ne1;
+            break;
+        case 2:
+            i_src1 = (i / (ne0*ne1)) % ne2;
+            break;
+        default:
+            i_src1 = i / (ne0*ne1*ne2);
+            break;
+    }
+
+    dst[i] = bin_op(src0[i], src1[i_src1]);
+}
+
+static int ggml_cuda_get_bin_bcast_axis_f32(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return -1;
+    }
+    if (!ggml_are_same_shape(src0, dst) || !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+        return -1;
+    }
+    if (ggml_nelements(src1) == ggml_nelements(dst)) {
+        return -1;
+    }
+
+    int axis = -1;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (src1->ne[i] == dst->ne[i]) {
+            if (axis >= 0) {
+                return -1;
+            }
+            axis = i;
+        } else if (src1->ne[i] != 1) {
+            return -1;
+        }
+    }
+
+    return axis;
+}
+
+template <float (*bin_op)(const float, const float)>
+static bool ggml_cuda_try_bin_bcast_axis_f32(const ggml_tensor * src0,
+                                             const ggml_tensor * src1,
+                                             ggml_tensor * dst,
+                                             cudaStream_t stream) {
+    static const bool disabled =
+        std::getenv("GGML_CUDA_DISABLE_BIN_BCAST_AXIS_FAST") != nullptr &&
+        std::atoi(std::getenv("GGML_CUDA_DISABLE_BIN_BCAST_AXIS_FAST"));
+    if (disabled) {
+        return false;
+    }
+
+    const int axis = ggml_cuda_get_bin_bcast_axis_f32(src0, src1, dst);
+    if (axis < 0) {
+        return false;
+    }
+
+    const int64_t total = ggml_nelements(dst);
+    const int block_size = 256;
+    const int blocks = (total + block_size - 1) / block_size;
+    k_bin_bcast_axis_f32<bin_op><<<blocks, block_size, 0, stream>>>(
+        (const float *) src0->data, (const float *) src1->data, (float *) dst->data,
+        total, dst->ne[0], dst->ne[1], dst->ne[2], axis);
+    return true;
 }
 
 template <float (*bin_op)(const float, const float), typename src0_t, typename src1_t, typename dst_t, size_t... I>
@@ -414,6 +500,9 @@ void ggml_cuda_op_repeat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 void ggml_cuda_op_add(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (ggml_cuda_try_bin_bcast_axis_f32<op_add>(dst->src[0], dst->src[1], dst, ctx.stream())) {
+        return;
+    }
     ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_add>>(dst->src[0], dst->src[1], dst, dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
 }
 
@@ -429,6 +518,10 @@ static void ggml_cuda_op_add_unary_impl(ggml_backend_cuda_context & ctx, const g
 
     ggml_tensor fused = *add;
     fused.data = unary->data;
+
+    if (ggml_cuda_try_bin_bcast_axis_f32<op>(src0, src1, &fused, ctx.stream())) {
+        return;
+    }
 
     launch_bin_bcast_pack<op, float, float, float>(
         src0, src1, &fused, (const float *) src0->data, (const float *) src1->data, (float *) unary->data,
