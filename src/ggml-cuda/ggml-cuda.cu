@@ -3716,6 +3716,64 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+static bool ggml_cuda_is_skippable_for_fusion(const ggml_tensor * node) {
+    return ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
+           node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE ||
+           (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0;
+}
+
+static int ggml_cuda_next_nontrivial_node(const ggml_cgraph * cgraph, int i) {
+    for (; i < cgraph->n_nodes; ++i) {
+        if (!ggml_cuda_is_skippable_for_fusion(cgraph->nodes[i])) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static bool ggml_cuda_can_fuse_norm_affine_nonseq(const ggml_cgraph * cgraph, const int * idxs, int count) {
+    GGML_ASSERT(count == 2 || count == 3);
+
+    ggml_op ops[3] = { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD };
+    int outputs[1] = { idxs[count - 1] };
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, count, ops, outputs, 1)) {
+        return false;
+    }
+
+    const ggml_tensor * norm = cgraph->nodes[idxs[0]];
+    const ggml_tensor * mul  = cgraph->nodes[idxs[1]];
+    const ggml_tensor * add  = count == 3 ? cgraph->nodes[idxs[2]] : nullptr;
+
+    GGML_ASSERT(norm->src[0]->type == GGML_TYPE_F32);
+    GGML_ASSERT(norm->type == GGML_TYPE_F32);
+
+    if (mul->src[0]->type != GGML_TYPE_F32 ||
+        mul->src[1]->type != GGML_TYPE_F32 ||
+        mul->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    if (add && (add->src[0]->type != GGML_TYPE_F32 ||
+                add->src[1]->type != GGML_TYPE_F32 ||
+                add->type != GGML_TYPE_F32)) {
+        return false;
+    }
+
+    if (norm == mul->src[1] && !ggml_are_same_shape(mul->src[0], norm)) {
+        return false;
+    }
+
+    if (!ggml_is_contiguous_rows(mul->src[0]) || !ggml_is_contiguous_rows(mul->src[1])) {
+        return false;
+    }
+
+    if (add && (!ggml_is_contiguous(add->src[0]) || !ggml_is_contiguous_rows(add->src[1]))) {
+        return false;
+    }
+
+    return true;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4034,6 +4092,27 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     static const bool disable_norm_fusion =
         getenv("GGML_CUDA_DISABLE_NORM_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_NORM_FUSION"));
+
+    if (!disable_norm_fusion && node->op == GGML_OP_NORM) {
+        const int mul_idx = ggml_cuda_next_nontrivial_node(cgraph, i + 1);
+        const int add_idx = mul_idx >= 0 ? ggml_cuda_next_nontrivial_node(cgraph, mul_idx + 1) : -1;
+
+        if (add_idx >= 0) {
+            int idxs[3] = { i, mul_idx, add_idx };
+            if (ggml_cuda_can_fuse_norm_affine_nonseq(cgraph, idxs, 3)) {
+                ggml_cuda_op_norm_fused_add(*cuda_ctx, node, cgraph->nodes[mul_idx], cgraph->nodes[add_idx]);
+                return add_idx - i;
+            }
+        }
+
+        if (mul_idx >= 0) {
+            int idxs[2] = { i, mul_idx };
+            if (ggml_cuda_can_fuse_norm_affine_nonseq(cgraph, idxs, 2)) {
+                ggml_cuda_op_norm_fused(*cuda_ctx, node, cgraph->nodes[mul_idx]);
+                return mul_idx - i;
+            }
+        }
+    }
 
     if (!disable_norm_fusion && ggml_cuda_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
         ggml_cuda_op_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);

@@ -69,10 +69,10 @@ static __global__ void norm_f32(
         if constexpr (do_multiply && do_add) {
             const uint32_t mul_col = fastmodulo(col, mul_ncols_packed);
             const uint32_t add_col = fastmodulo(col, add_ncols_packed);
-            dst[col] = norm * mul[mul_col] + add[add_col];
+            dst[col] = __fadd_rn(__fmul_rn(norm, mul[mul_col]), add[add_col]);
         } else if constexpr (do_multiply) {
             const uint32_t mul_col = fastmodulo(col, mul_ncols_packed);
-            dst[col] = norm * mul[mul_col];
+            dst[col] = __fmul_rn(norm, mul[mul_col]);
         } else {
             dst[col] = norm;
         }
