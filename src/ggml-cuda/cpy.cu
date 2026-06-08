@@ -1,6 +1,8 @@
 #include "cpy.cuh"
 #include "dequantize.cuh"
 #include "cpy-utils.cuh"
+#include <cstdint>
+#include <type_traits>
 #if defined(GGML_USE_MUSA) && defined(GGML_MUSA_MUDNN_COPY)
 #include "ggml-musa/mudnn.cuh"
 #endif // GGML_USE_MUSA && GGML_MUSA_MUDNN_COPY
@@ -37,6 +39,116 @@ static __global__ void cpy_scalar(const char * cx, char * cdst, const int64_t ne
     const int64_t dst_offset = i10*nb10 + i11*nb11 + i12*nb12 + i13 * nb13;
 
     cpy_1(cx + x_offset, cdst + dst_offset);
+}
+
+template <cpy_kernel_t cpy_1, typename dst_t>
+static __global__ void cpy_scalar_to_contiguous(const char * cx, char * cdst, const int64_t ne,
+                                                const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01,
+                                                const int64_t nb02, const int64_t nb03) {
+    const int64_t i = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= ne) {
+        return;
+    }
+
+    const int64_t i03 = i/(ne00 * ne01 * ne02);
+    const int64_t i02 = (i - i03*ne00*ne01*ne02) / (ne00*ne01);
+    const int64_t i01 = (i - i03*ne00*ne01*ne02 - i02*ne01*ne00) / ne00;
+    const int64_t i00 = i - i03*ne00*ne01*ne02 - i02*ne01*ne00 - i01*ne00;
+    const int64_t x_offset = i00*nb00 + i01*nb01 + i02*nb02 + i03*nb03;
+
+    cpy_1(cx + x_offset, cdst + i*sizeof(dst_t));
+}
+
+template <cpy_kernel_t cpy_1, typename dst_t>
+static __global__ void cpy_scalar_to_contiguous_rows(const char * cx, char * cdst,
+                                                     const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nrows,
+                                                     const int64_t nb00, const int64_t nb01, const int64_t nb02, const int64_t nb03) {
+    const int64_t row = blockIdx.x;
+    if (row >= nrows) {
+        return;
+    }
+
+    const int64_t i03 = row/(ne01 * ne02);
+    const int64_t i02 = (row - i03*ne01*ne02) / ne01;
+    const int64_t i01 = row - i03*ne01*ne02 - i02*ne01;
+    const int64_t row_src_offset = i01*nb01 + i02*nb02 + i03*nb03;
+    const int64_t row_dst_offset = row*ne00*sizeof(dst_t);
+
+    for (int64_t i00 = threadIdx.x; i00 < ne00; i00 += blockDim.x) {
+        cpy_1(cx + row_src_offset + i00*nb00, cdst + row_dst_offset + i00*sizeof(dst_t));
+    }
+}
+
+static __global__ void cpy_f32_to_contiguous_rows_vec4(const char * cx, char * cdst,
+                                                       const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nrows,
+                                                       const int64_t nb01, const int64_t nb02, const int64_t nb03) {
+    const int64_t row = blockIdx.x;
+    if (row >= nrows) {
+        return;
+    }
+
+    const int64_t i03 = row/(ne01 * ne02);
+    const int64_t i02 = (row - i03*ne01*ne02) / ne01;
+    const int64_t i01 = row - i03*ne01*ne02 - i02*ne01;
+    const int64_t row_src_offset = i01*nb01 + i02*nb02 + i03*nb03;
+
+    const float4 * src = (const float4 *) (cx + row_src_offset);
+    float4 * dst = (float4 *) (cdst + row*ne00*sizeof(float));
+    const int64_t ne00_vec4 = ne00 / 4;
+
+    for (int64_t i = threadIdx.x; i < ne00_vec4; i += blockDim.x) {
+        dst[i] = src[i];
+    }
+}
+
+static __global__ void cpy_f32_to_contiguous_rows_bias_axis0(const char * __restrict__ cx,
+                                                             const float * __restrict__ bias,
+                                                             float * __restrict__ dst,
+                                                             const int64_t ne00,
+                                                             const int64_t ne01,
+                                                             const int64_t ne02,
+                                                             const int64_t nrows,
+                                                             const int64_t nb00,
+                                                             const int64_t nb01,
+                                                             const int64_t nb02,
+                                                             const int64_t nb03) {
+    const int64_t row = blockIdx.x;
+    if (row >= nrows) {
+        return;
+    }
+
+    const int64_t i03 = row/(ne01 * ne02);
+    const int64_t i02 = (row - i03*ne01*ne02) / ne01;
+    const int64_t i01 = row - i03*ne01*ne02 - i02*ne01;
+    const int64_t row_src_offset = i01*nb01 + i02*nb02 + i03*nb03;
+    const int64_t row_dst_offset = row*ne00;
+
+    for (int64_t i00 = threadIdx.x; i00 < ne00; i00 += blockDim.x) {
+        const float x = *(const float *) (cx + row_src_offset + i00*nb00);
+        dst[row_dst_offset + i00] = x + bias[i00];
+    }
+}
+
+static __global__ void add_bias_axis2_permute_2013_cont(const float * __restrict__ src,
+                                                        const float * __restrict__ bias,
+                                                        float * __restrict__ dst,
+                                                        const int64_t width,
+                                                        const int64_t height,
+                                                        const int64_t channels,
+                                                        const int64_t batches) {
+    const int64_t i = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
+    const int64_t ne = width*height*channels*batches;
+    if (i >= ne) {
+        return;
+    }
+
+    const int64_t c = i % channels;
+    const int64_t x = (i / channels) % width;
+    const int64_t y = (i / (channels*width)) % height;
+    const int64_t b = i / (channels*width*height);
+    const int64_t src_idx = x + width*(y + height*(c + channels*b));
+    dst[i] = src[src_idx] + bias[c];
 }
 
 template <typename T>
@@ -196,7 +308,7 @@ cudaStream_t stream) {
         (cx, cdst, ne);
 }
 
-template<typename src_t, typename dst_t, bool transposed = false>
+template<typename src_t, typename dst_t, bool transposed = false, bool dst_contiguous = false>
 static void ggml_cpy_scalar_cuda(
     const char * cx, char * cdst, const int64_t ne,
     const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
@@ -225,6 +337,32 @@ static void ggml_cpy_scalar_cuda(
         dim3 dimBlock(CUDA_CPY_TILE_DIM_2D, CUDA_CPY_BLOCK_ROWS, 1);
         cpy_scalar_transpose<dst_t><<<dimGrid, dimBlock, 0, stream>>>
             (cx, cdst, ne, ne00n, ne01n, ne02n, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+    } else if (dst_contiguous) {
+        const int64_t nrows = ne / ne00;
+        if (ne00 >= 32 && nrows < UINT_MAX &&
+            getenv("GGML_CUDA_DISABLE_CPY_TO_CONTIGUOUS_ROW_FASTPATH") == nullptr) {
+            bool use_vec4 = false;
+            if constexpr (std::is_same_v<src_t, float> && std::is_same_v<dst_t, float>) {
+                use_vec4 =
+                    getenv("GGML_CUDA_DISABLE_CPY_TO_CONTIGUOUS_ROW_VEC4") == nullptr &&
+                    nb00 == sizeof(float) && ne00 % 4 == 0 &&
+                    reinterpret_cast<uintptr_t>(cx) % alignof(float4) == 0 &&
+                    reinterpret_cast<uintptr_t>(cdst) % alignof(float4) == 0 &&
+                    nb01 % alignof(float4) == 0 && nb02 % alignof(float4) == 0 && nb03 % alignof(float4) == 0;
+            }
+            if (use_vec4) {
+                cpy_f32_to_contiguous_rows_vec4<<<nrows, CUDA_CPY_BLOCK_SIZE, 0, stream>>>
+                    (cx, cdst, ne00, ne01, ne02, nrows, nb01, nb02, nb03);
+            } else {
+                cpy_scalar_to_contiguous_rows<cpy_1_scalar<src_t, dst_t>, dst_t><<<nrows, CUDA_CPY_BLOCK_SIZE, 0, stream>>>
+                    (cx, cdst, ne00, ne01, ne02, nrows, nb00, nb01, nb02, nb03);
+            }
+        } else {
+            const int64_t num_blocks = (ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
+            GGML_ASSERT(num_blocks < UINT_MAX);
+            cpy_scalar_to_contiguous<cpy_1_scalar<src_t, dst_t>, dst_t><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>
+                (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03);
+        }
     } else {
         const int64_t num_blocks = (ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
         GGML_ASSERT(num_blocks < UINT_MAX);
@@ -404,6 +542,8 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
     char * src1_ddc = (char *) src1->data;
 
     const bool contiguous_srcs = ggml_is_contiguous(src0) && ggml_is_contiguous(src1);
+    const bool use_to_contiguous_fastpath = ggml_is_contiguous(src1) &&
+        getenv("GGML_CUDA_DISABLE_CPY_TO_CONTIGUOUS_FASTPATH") == nullptr;
     const bool can_be_transposed = nb01 == (int64_t)ggml_element_size(src0) &&
         src0->ne[3] == 1 && nb02 == ne00 * ne01 * (int64_t)ggml_element_size(src0);
 
@@ -420,6 +560,9 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
         if (can_be_transposed) {
             ggml_cpy_scalar_cuda<float, float, true>
+                (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
+        } else if (use_to_contiguous_fastpath) {
+            ggml_cpy_scalar_cuda<float, float, false, true>
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
         } else {
             ggml_cpy_scalar_cuda<float, float>
@@ -550,6 +693,87 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
         GGML_ABORT("%s: unsupported type combination (%s to %s)\n", __func__,
                 ggml_type_name(src0->type), ggml_type_name(src1->type));
     }
+}
+
+bool ggml_cuda_cpy_bias_axis0(ggml_backend_cuda_context & ctx,
+                              const ggml_tensor * src,
+                              const ggml_tensor * bias,
+                              ggml_tensor * dst) {
+    if (std::getenv("GGML_CUDA_DISABLE_CPY_BIAS_AXIS0_FUSION") != nullptr &&
+        std::atoi(std::getenv("GGML_CUDA_DISABLE_CPY_BIAS_AXIS0_FUSION"))) {
+        return false;
+    }
+
+    if (src->type != GGML_TYPE_F32 || bias->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_are_same_shape(src, dst) || !ggml_is_contiguous(dst) || !ggml_is_contiguous(bias)) {
+        return false;
+    }
+    if (bias->ne[0] != dst->ne[0] || bias->ne[1] != 1 || bias->ne[2] != 1 || bias->ne[3] != 1) {
+        return false;
+    }
+
+    const int64_t ne00 = src->ne[0];
+    const int64_t nrows = ggml_nelements(src) / ne00;
+    if (ne00 < 32 || nrows >= UINT_MAX) {
+        return false;
+    }
+
+    cpy_f32_to_contiguous_rows_bias_axis0<<<nrows, CUDA_CPY_BLOCK_SIZE, 0, ctx.stream()>>>(
+        (const char *) src->data, (const float *) bias->data, (float *) dst->data,
+        ne00, src->ne[1], src->ne[2], nrows, src->nb[0], src->nb[1], src->nb[2], src->nb[3]);
+    return true;
+}
+
+bool ggml_cuda_add_bias_axis2_permute_cont(ggml_backend_cuda_context & ctx,
+                                           const ggml_tensor * add,
+                                           ggml_tensor * cont) {
+    if (std::getenv("GGML_CUDA_DISABLE_ADD_BIAS_PERMUTE_CONT_FUSION") != nullptr &&
+        std::atoi(std::getenv("GGML_CUDA_DISABLE_ADD_BIAS_PERMUTE_CONT_FUSION"))) {
+        return false;
+    }
+
+    if (add == nullptr || cont == nullptr || add->op != GGML_OP_ADD || cont->op != GGML_OP_CONT ||
+        cont->src[0] == nullptr || cont->src[0]->op != GGML_OP_PERMUTE || cont->src[0]->src[0] != add) {
+        return false;
+    }
+
+    const ggml_tensor * src = nullptr;
+    const ggml_tensor * bias = nullptr;
+    if (add->src[0] != nullptr && add->src[1] != nullptr &&
+        add->src[0]->type == GGML_TYPE_F32 && add->src[1]->type == GGML_TYPE_F32) {
+        if (add->src[1]->ne[0] == 1 && add->src[1]->ne[1] == 1 &&
+            add->src[1]->ne[2] == add->ne[2] && add->src[1]->ne[3] == 1) {
+            src = add->src[0];
+            bias = add->src[1];
+        } else if (add->src[0]->ne[0] == 1 && add->src[0]->ne[1] == 1 &&
+                   add->src[0]->ne[2] == add->ne[2] && add->src[0]->ne[3] == 1) {
+            src = add->src[1];
+            bias = add->src[0];
+        }
+    }
+
+    if (src == nullptr || bias == nullptr || add->type != GGML_TYPE_F32 || cont->type != GGML_TYPE_F32 ||
+        src->type != GGML_TYPE_F32 || bias->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_are_same_shape(src, add) || !ggml_is_contiguous(src) ||
+        !ggml_is_contiguous(bias) || !ggml_is_contiguous(cont)) {
+        return false;
+    }
+    if (cont->ne[0] != add->ne[2] || cont->ne[1] != add->ne[0] ||
+        cont->ne[2] != add->ne[1] || cont->ne[3] != add->ne[3]) {
+        return false;
+    }
+
+    const int64_t ne = ggml_nelements(cont);
+    const int64_t blocks = (ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
+    GGML_ASSERT(blocks < UINT_MAX);
+    add_bias_axis2_permute_2013_cont<<<blocks, CUDA_CPY_BLOCK_SIZE, 0, ctx.stream()>>>(
+        (const float *) src->data, (const float *) bias->data, (float *) cont->data,
+        add->ne[0], add->ne[1], add->ne[2], add->ne[3]);
+    return true;
 }
 
 void ggml_cuda_dup(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

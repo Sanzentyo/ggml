@@ -1,4 +1,5 @@
 #include "binbcast.cuh"
+#include "mmq.cuh"
 #include "unary.cuh"
 #include <cstdlib>
 #include <cstdint>
@@ -204,6 +205,122 @@ static __global__ void k_bin_bcast_axis_f32(const float * __restrict__ src0,
     dst[i] = bin_op(src0[i], src1[i_src1]);
 }
 
+template <float (*bin_op)(const float, const float)>
+static __global__ void k_bin_bcast_axis0_f32(const float * __restrict__ src0,
+                                             const float * __restrict__ src1,
+                                             float * __restrict__ dst,
+                                             const int64_t ne0,
+                                             const int64_t nrows) {
+    const int64_t i0 = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+    if (i0 >= ne0) {
+        return;
+    }
+
+    const int64_t row = int64_t(blockIdx.z)*gridDim.y + blockIdx.y;
+    if (row >= nrows) {
+        return;
+    }
+
+    const int64_t offset = row*ne0 + i0;
+    dst[offset] = bin_op(src0[offset], src1[i0]);
+}
+
+template <float (*bin_op)(const float, const float)>
+static __global__ void k_bin_bcast_axis2_f32(const float * __restrict__ src0,
+                                             const float * __restrict__ src1,
+                                             float * __restrict__ dst,
+                                             const int64_t plane,
+                                             const int64_t ne2) {
+    const int64_t i01 = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+    if (i01 >= plane) {
+        return;
+    }
+
+    const int64_t i2 = blockIdx.y % ne2;
+    const int64_t offset = int64_t(blockIdx.y)*plane + i01;
+    dst[offset] = bin_op(src0[offset], src1[i2]);
+}
+
+template <mmq_q8_1_ds_layout ds_layout, int cols_per_block>
+static __global__ void k_add_and_quantize_mmq_q8_1_warp_cols(const float * __restrict__ src0,
+                                                             const float * __restrict__ src1,
+                                                             float * __restrict__ dst,
+                                                             void * __restrict__ vy,
+                                                             const int64_t ne00,
+                                                             const int64_t ne0,
+                                                             const int64_t ne1,
+                                                             const int64_t ne2) {
+    constexpr int vals_per_mmq_block = 4 * QK8_1;
+
+    const int lane = threadIdx.x;
+    const int warp = threadIdx.y;
+    const int64_t i1 = (int64_t) blockIdx.x * cols_per_block + warp;
+    if (i1 >= ne1) {
+        return;
+    }
+
+    const int64_t qblock = blockIdx.y;
+    const int64_t i0 = qblock * vals_per_mmq_block + lane * 4;
+    const int64_t i2 = blockIdx.z % ne2;
+    const int64_t i3 = blockIdx.z / ne2;
+    const int64_t row_base = ((i3 * ne2 + i2) * ne1 + i1) * ne00;
+
+    float values[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int64_t col = i0 + k;
+        if (col < ne00) {
+            const int64_t idx = row_base + col;
+            values[k] = src0[idx] + src1[idx];
+            dst[idx] = values[k];
+        }
+    }
+
+    const float4 xi = make_float4(values[0], values[1], values[2], values[3]);
+    float amax = fabsf(xi.x);
+    amax = fmaxf(amax, fabsf(xi.y));
+    amax = fmaxf(amax, fabsf(xi.z));
+    amax = fmaxf(amax, fabsf(xi.w));
+
+#pragma unroll
+    for (int offset = 4; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
+    }
+
+    float sum;
+    if constexpr (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4) {
+        sum = xi.x + xi.y + xi.z + xi.w;
+#pragma unroll
+        for (int offset = 4; offset > 0; offset >>= 1) {
+            sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
+        }
+    }
+
+    const float d_inv = 127.0f / amax;
+    const char4 q = make_char4(roundf(xi.x * d_inv),
+                               roundf(xi.y * d_inv),
+                               roundf(xi.z * d_inv),
+                               roundf(xi.w * d_inv));
+
+    block_q8_1_mmq * y = (block_q8_1_mmq *) vy;
+    const int64_t ib0 = blockIdx.z * ((int64_t) gridDim.y * ne1);
+    const int64_t ib = ib0 + qblock * ne1 + i1;
+    char4 * yqs4 = (char4 *) y[ib].qs;
+    yqs4[lane] = q;
+
+    const int iqs = lane * 4;
+    if (iqs % 32 == 0) {
+        const float d = 1.0f / d_inv;
+        if constexpr (ds_layout == MMQ_Q8_1_DS_LAYOUT_D4) {
+            y[ib].d4[iqs / 32] = d;
+        } else {
+            y[ib].ds4[iqs / 32] = make_half2(d, sum);
+        }
+    }
+
+    GGML_UNUSED(ne0);
+}
+
 template <float (*bin_op)(const float, const float), typename src0_t, typename src1_t, typename dst_t>
 static __global__ void k_bin_contiguous(const src0_t * __restrict__ src0,
                                         const src1_t * __restrict__ src1,
@@ -215,6 +332,54 @@ static __global__ void k_bin_contiguous(const src0_t * __restrict__ src0,
     }
 
     dst[i] = (dst_t) bin_op((float) src0[i], (float) src1[i]);
+}
+
+template <typename src_t, typename dst_t>
+static __global__ void k_rope_pair_fused(const src_t * __restrict__ x_re,
+                                         const src_t * __restrict__ x_im,
+                                         const float * __restrict__ cos,
+                                         const float * __restrict__ sin,
+                                         dst_t * __restrict__ dst,
+                                         const int64_t half,
+                                         const int64_t n_tokens,
+                                         const int64_t n_heads_b,
+                                         const int64_t x_re_s1,
+                                         const int64_t x_re_s2,
+                                         const int64_t x_re_s3,
+                                         const int64_t x_im_s1,
+                                         const int64_t x_im_s2,
+                                         const int64_t x_im_s3,
+                                         const int64_t cos_s1,
+                                         const int64_t cos_s2,
+                                         const int64_t sin_s1,
+                                         const int64_t sin_s2,
+                                         const int64_t dst_s0,
+                                         const int64_t dst_s1,
+                                         const int64_t dst_s2,
+                                         const int64_t dst_s3) {
+    const int64_t i = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
+    const int64_t total = half * n_tokens * n_heads_b;
+    if (i >= total) {
+        return;
+    }
+
+    const int64_t h = i % half;
+    const int64_t t = (i / half) % n_tokens;
+    const int64_t b = i / (half * n_tokens);
+
+    const float re = (float) x_re[h * x_re_s1 + t * x_re_s2 + b * x_re_s3];
+    const float im = (float) x_im[h * x_im_s1 + t * x_im_s2 + b * x_im_s3];
+    const float c  = cos[h * cos_s1 + t * cos_s2];
+    const float s  = sin[h * sin_s1 + t * sin_s2];
+
+    const int64_t dst_base = h * dst_s1 + t * dst_s2 + b * dst_s3;
+    const float re_c = __fmul_rn(re, c);
+    const float im_s = __fmul_rn(im, s);
+    const float re_s = __fmul_rn(re, s);
+    const float im_c = __fmul_rn(im, c);
+
+    dst[dst_base]          = (dst_t) __fsub_rn(re_c, im_s);
+    dst[dst_base + dst_s0] = (dst_t) __fadd_rn(re_s, im_c);
 }
 
 static int ggml_cuda_get_bin_bcast_axis_f32(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
@@ -262,6 +427,33 @@ static bool ggml_cuda_try_bin_bcast_axis_f32(const ggml_tensor * src0,
 
     const int64_t total = ggml_nelements(dst);
     const int block_size = 256;
+    const bool disable_axis0 =
+        std::getenv("GGML_CUDA_DISABLE_BIN_BCAST_AXIS0_FAST") != nullptr &&
+        std::atoi(std::getenv("GGML_CUDA_DISABLE_BIN_BCAST_AXIS0_FAST"));
+    const int64_t axis0_grid_y = total / dst->ne[0];
+    if (axis == 0 && !disable_axis0) {
+        const int64_t grid_y = std::min<int64_t>(axis0_grid_y, 65535);
+        const int64_t grid_z = (axis0_grid_y + grid_y - 1) / grid_y;
+        if (grid_z <= 65535) {
+            const dim3 blocks((dst->ne[0] + block_size - 1) / block_size, grid_y, grid_z);
+            k_bin_bcast_axis0_f32<bin_op><<<blocks, block_size, 0, stream>>>(
+                (const float *) src0->data, (const float *) src1->data, (float *) dst->data, dst->ne[0], axis0_grid_y);
+            return true;
+        }
+    }
+
+    const bool disable_axis2 =
+        std::getenv("GGML_CUDA_DISABLE_BIN_BCAST_AXIS2_FAST") != nullptr &&
+        std::atoi(std::getenv("GGML_CUDA_DISABLE_BIN_BCAST_AXIS2_FAST"));
+    const int64_t axis2_grid_y = dst->ne[2]*dst->ne[3];
+    if (axis == 2 && !disable_axis2 && axis2_grid_y <= 65535) {
+        const int64_t plane = dst->ne[0]*dst->ne[1];
+        const dim3 blocks((plane + block_size - 1) / block_size, axis2_grid_y, 1);
+        k_bin_bcast_axis2_f32<bin_op><<<blocks, block_size, 0, stream>>>(
+            (const float *) src0->data, (const float *) src1->data, (float *) dst->data, plane, dst->ne[2]);
+        return true;
+    }
+
     const int blocks = (total + block_size - 1) / block_size;
     k_bin_bcast_axis_f32<bin_op><<<blocks, block_size, 0, stream>>>(
         (const float *) src0->data, (const float *) src1->data, (float *) dst->data,
@@ -522,16 +714,26 @@ static void ggml_cuda_op_bin_bcast(
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
     const void * src0_dd, const void * src1_dd, void * dst_dd, cudaStream_t stream) {
 
-    GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_BF16);
 
     if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
-        op()(src0, src1, dst, (const float *)src0_dd, (const float *)src1_dd, (float *)dst_dd, stream);
+        if (src1->type == GGML_TYPE_BF16) {
+            op()(src0, src1, dst, (const float *)src0_dd, (const nv_bfloat16 *)src1_dd, (float *)dst_dd, stream);
+        } else if (src1->type == GGML_TYPE_F16) {
+            op()(src0, src1, dst, (const float *)src0_dd, (const half *)src1_dd, (float *)dst_dd, stream);
+        } else {
+            op()(src0, src1, dst, (const float *)src0_dd, (const float *)src1_dd, (float *)dst_dd, stream);
+        }
     } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16) {
         op()(src0, src1, dst, (const half *) src0_dd, (const half *)src1_dd, (half *) dst_dd, stream);
     } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16) {
         op()(src0, src1, dst, (const half *) src0_dd, (const float *)src1_dd, (half *) dst_dd, stream);
     } else if (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
         op()(src0, src1, dst, (const half *) src0_dd, (const float *)src1_dd, (float *)dst_dd, stream);
+    } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_BF16) {
+        op()(src0, src1, dst, (const nv_bfloat16 *) src0_dd, (const nv_bfloat16 *)src1_dd, (nv_bfloat16 *) dst_dd, stream);
+    } else if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_BF16) {
+        op()(src0, src1, dst, (const nv_bfloat16 *) src0_dd, (const float *)src1_dd, (nv_bfloat16 *) dst_dd, stream);
     } else {
         fprintf(stderr, "%s: unsupported types: dst: %s, src0: %s, src1: %s\n", __func__,
             ggml_type_name(dst->type), ggml_type_name(src0->type), ggml_type_name(src1->type));
@@ -544,10 +746,103 @@ void ggml_cuda_op_repeat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 void ggml_cuda_op_add(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (ggml_cuda_op_add_with_mmq_q8_1_prequant(ctx, dst)) {
+        return;
+    }
     if (ggml_cuda_try_bin_bcast_axis_f32<op_add>(dst->src[0], dst->src[1], dst, ctx.stream())) {
         return;
     }
     ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_add>>(dst->src[0], dst->src[1], dst, dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
+}
+
+bool ggml_cuda_op_add_with_mmq_q8_1_prequant(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (ctx.mmq_prequant_target_tensor != dst || ctx.mmq_prequant_cache_key_tensor == nullptr) {
+        return false;
+    }
+
+    const auto clear_target = [&ctx] {
+        ctx.mmq_prequant_target_tensor = nullptr;
+        ctx.mmq_prequant_cache_key_tensor = nullptr;
+        ctx.mmq_prequant_target_consumer_type = GGML_TYPE_COUNT;
+        ctx.mmq_prequant_target_ne0_padded = 0;
+        ctx.mmq_prequant_target_ne1 = 0;
+        ctx.mmq_prequant_target_ne2 = 0;
+        ctx.mmq_prequant_target_ne3 = 0;
+        ctx.mmq_prequant_target_q8_only = false;
+    };
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    if (src0 == nullptr || src1 == nullptr ||
+        dst->type != GGML_TYPE_F32 || src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 ||
+        (ctx.mmq_prequant_target_consumer_type != GGML_TYPE_Q4_1 &&
+         ctx.mmq_prequant_target_consumer_type != GGML_TYPE_Q8_0) ||
+        !ggml_are_same_shape(src0, src1) || !ggml_are_same_shape(src0, dst) ||
+        !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst) ||
+        ctx.mmq_prequant_target_ne0_padded <= 0 || ctx.mmq_prequant_target_ne1 <= 0 ||
+        ctx.mmq_prequant_target_ne2 <= 0 || ctx.mmq_prequant_target_ne3 <= 0) {
+        clear_target();
+        return false;
+    }
+
+    const int64_t ne00 = ctx.mmq_prequant_cache_key_tensor->ne[0];
+    const int64_t ne0_padded = ctx.mmq_prequant_target_ne0_padded;
+    const int64_t ne1 = ctx.mmq_prequant_target_ne1;
+    const int64_t ne2 = ctx.mmq_prequant_target_ne2;
+    const int64_t ne3 = ctx.mmq_prequant_target_ne3;
+    if (ne00 != dst->ne[0] || ne0_padded % (4 * QK8_1) != 0 ||
+        ne1 * ne2 * ne3 * ne00 != ggml_nelements(dst)) {
+        clear_target();
+        return false;
+    }
+
+    ggml_backend_cuda_context::mmq_prequant_cache_entry entry;
+    const size_t nbytes_q8_1 =
+        ne3 * ne2 * ne1 * ne0_padded * sizeof(block_q8_1) / QK8_1 +
+        get_mmq_x_max_host(ggml_cuda_info().devices[ctx.device].cc) * sizeof(block_q8_1_mmq);
+    entry.consumer_type = ctx.mmq_prequant_target_consumer_type;
+    entry.ne0_padded = ne0_padded;
+    entry.ne1 = ne1;
+    entry.ne2 = ne2;
+    entry.ne3 = ne3;
+    entry.storage = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), nbytes_q8_1);
+    entry.data = entry.storage->get();
+
+    const int cols_per_block = [] {
+        const char * env = getenv("GGML_CUDA_MMQ_ADD_PREQUANT_WARP_COLS");
+        return env == nullptr ? 4 : atoi(env);
+    }();
+    const int64_t qblocks = ne0_padded / (4 * QK8_1);
+#define GGML_CUDA_LAUNCH_ADD_PREQUANT(DS_LAYOUT)                                                                                       \
+    do {                                                                                                                               \
+        if (cols_per_block == 16) {                                                                                                    \
+            const dim3 num_blocks((ne1 + 15) / 16, qblocks, ne2 * ne3);                                                                \
+            const dim3 block_size(WARP_SIZE, 16, 1);                                                                                   \
+            k_add_and_quantize_mmq_q8_1_warp_cols<DS_LAYOUT, 16><<<num_blocks, block_size, 0, ctx.stream()>>>(                         \
+                (const float *) src0->data, (const float *) src1->data, (float *) dst->data, entry.data, ne00, ne0_padded, ne1, ne2);  \
+        } else if (cols_per_block == 8) {                                                                                              \
+            const dim3 num_blocks((ne1 + 7) / 8, qblocks, ne2 * ne3);                                                                  \
+            const dim3 block_size(WARP_SIZE, 8, 1);                                                                                    \
+            k_add_and_quantize_mmq_q8_1_warp_cols<DS_LAYOUT, 8><<<num_blocks, block_size, 0, ctx.stream()>>>(                          \
+                (const float *) src0->data, (const float *) src1->data, (float *) dst->data, entry.data, ne00, ne0_padded, ne1, ne2);  \
+        } else {                                                                                                                       \
+            const dim3 num_blocks((ne1 + 3) / 4, qblocks, ne2 * ne3);                                                                  \
+            const dim3 block_size(WARP_SIZE, 4, 1);                                                                                    \
+            k_add_and_quantize_mmq_q8_1_warp_cols<DS_LAYOUT, 4><<<num_blocks, block_size, 0, ctx.stream()>>>(                          \
+                (const float *) src0->data, (const float *) src1->data, (float *) dst->data, entry.data, ne00, ne0_padded, ne1, ne2);  \
+        }                                                                                                                             \
+    } while (0)
+    if (mmq_get_q8_1_ds_layout(ctx.mmq_prequant_target_consumer_type) == MMQ_Q8_1_DS_LAYOUT_D4) {
+        GGML_CUDA_LAUNCH_ADD_PREQUANT(MMQ_Q8_1_DS_LAYOUT_D4);
+    } else {
+        GGML_CUDA_LAUNCH_ADD_PREQUANT(MMQ_Q8_1_DS_LAYOUT_DS4);
+    }
+#undef GGML_CUDA_LAUNCH_ADD_PREQUANT
+    CUDA_CHECK(cudaGetLastError());
+
+    ctx.mmq_prequant_cache.emplace_back(ctx.mmq_prequant_cache_key_tensor, std::move(entry));
+    clear_target();
+    return true;
 }
 
 template <float (*op)(const float, const float)>
@@ -555,21 +850,45 @@ static void ggml_cuda_op_add_unary_impl(ggml_backend_cuda_context & ctx, const g
     const ggml_tensor * src0 = add->src[0];
     const ggml_tensor * src1 = add->src[1];
 
-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
-    GGML_ASSERT(src1->type == GGML_TYPE_F32);
-    GGML_ASSERT(add->type == GGML_TYPE_F32);
-    GGML_ASSERT(unary->type == GGML_TYPE_F32);
-
     ggml_tensor fused = *add;
     fused.data = unary->data;
 
-    if (ggml_cuda_try_bin_bcast_axis_f32<op>(src0, src1, &fused, ctx.stream())) {
+    if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+        add->type == GGML_TYPE_F32 && unary->type == GGML_TYPE_F32) {
+        if (ggml_cuda_try_bin_bcast_axis_f32<op>(src0, src1, &fused, ctx.stream())) {
+            return;
+        }
+
+        launch_bin_bcast_pack<op, float, float, float>(
+            src0, src1, &fused, (const float *) src0->data, (const float *) src1->data, (float *) unary->data,
+            ctx.stream(), std::make_index_sequence<1>{});
         return;
     }
 
-    launch_bin_bcast_pack<op, float, float, float>(
-        src0, src1, &fused, (const float *) src0->data, (const float *) src1->data, (float *) unary->data,
-        ctx.stream(), std::make_index_sequence<1>{});
+    if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F32 &&
+        add->type == GGML_TYPE_BF16 && unary->type == GGML_TYPE_BF16) {
+        launch_bin_bcast_pack<op, nv_bfloat16, float, nv_bfloat16>(
+            src0, src1, &fused, (const nv_bfloat16 *) src0->data, (const float *) src1->data, (nv_bfloat16 *) unary->data,
+            ctx.stream(), std::make_index_sequence<1>{});
+        return;
+    }
+
+    if (src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_BF16 &&
+        add->type == GGML_TYPE_BF16 && unary->type == GGML_TYPE_BF16) {
+        launch_bin_bcast_pack<op, nv_bfloat16, nv_bfloat16, nv_bfloat16>(
+            src0, src1, &fused, (const nv_bfloat16 *) src0->data, (const nv_bfloat16 *) src1->data, (nv_bfloat16 *) unary->data,
+            ctx.stream(), std::make_index_sequence<1>{});
+        return;
+    }
+
+    fprintf(stderr,
+            "%s: unsupported types: add=%s unary=%s src0=%s src1=%s\n",
+            __func__,
+            ggml_type_name(add->type),
+            ggml_type_name(unary->type),
+            ggml_type_name(src0->type),
+            ggml_type_name(src1->type));
+    GGML_ABORT("unsupported add+unary fusion types");
 }
 
 void ggml_cuda_op_add_unary(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * unary) {
@@ -689,6 +1008,53 @@ void ggml_cuda_op_fused_mul(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
             break;
         default:
             GGML_ASSERT(false && "Unsupported n_fuse value");
+    }
+}
+
+void ggml_cuda_op_rope_pair_fused(ggml_backend_cuda_context & ctx,
+                                  const ggml_tensor * x_re,
+                                  const ggml_tensor * x_im,
+                                  const ggml_tensor * cos,
+                                  const ggml_tensor * sin,
+                                  ggml_tensor * dst) {
+    GGML_ASSERT(x_re->type == GGML_TYPE_F32 || x_re->type == GGML_TYPE_BF16);
+    GGML_ASSERT(x_im->type == x_re->type);
+    GGML_ASSERT(cos->type == GGML_TYPE_F32);
+    GGML_ASSERT(sin->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == x_re->type);
+
+    const int64_t half = x_re->ne[1];
+    const int64_t n_tokens = x_re->ne[2];
+    const int64_t n_heads_b = x_re->ne[3];
+    const int64_t total = half * n_tokens * n_heads_b;
+    const int block_size = 256;
+    const int blocks = (total + block_size - 1) / block_size;
+
+    const auto stride_type = [](const ggml_tensor * t, int dim) {
+        GGML_ASSERT(t->nb[dim] % ggml_type_size(t->type) == 0);
+        return int64_t(t->nb[dim] / ggml_type_size(t->type));
+    };
+
+    if (x_re->type == GGML_TYPE_BF16) {
+        k_rope_pair_fused<<<blocks, block_size, 0, ctx.stream()>>>(
+            (const nv_bfloat16 *) x_re->data, (const nv_bfloat16 *) x_im->data,
+            (const float *) cos->data, (const float *) sin->data, (nv_bfloat16 *) dst->data,
+            half, n_tokens, n_heads_b,
+            stride_type(x_re, 1), stride_type(x_re, 2), stride_type(x_re, 3),
+            stride_type(x_im, 1), stride_type(x_im, 2), stride_type(x_im, 3),
+            stride_type(cos, 1), stride_type(cos, 2),
+            stride_type(sin, 1), stride_type(sin, 2),
+            stride_type(dst, 0), stride_type(dst, 1), stride_type(dst, 2), stride_type(dst, 3));
+    } else {
+        k_rope_pair_fused<<<blocks, block_size, 0, ctx.stream()>>>(
+            (const float *) x_re->data, (const float *) x_im->data,
+            (const float *) cos->data, (const float *) sin->data, (float *) dst->data,
+            half, n_tokens, n_heads_b,
+            stride_type(x_re, 1), stride_type(x_re, 2), stride_type(x_re, 3),
+            stride_type(x_im, 1), stride_type(x_im, 2), stride_type(x_im, 3),
+            stride_type(cos, 1), stride_type(cos, 2),
+            stride_type(sin, 1), stride_type(sin, 2),
+            stride_type(dst, 0), stride_type(dst, 1), stride_type(dst, 2), stride_type(dst, 3));
     }
 }
 

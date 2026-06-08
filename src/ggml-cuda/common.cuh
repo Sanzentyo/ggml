@@ -1173,7 +1173,6 @@ struct ggml_tensor_extra_gpu {
     cudaEvent_t events[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS]; // events for synchronizing multiple GPUs
 };
 
-
 #if (defined(GGML_CUDA_USE_GRAPHS) || defined(GGML_HIP_GRAPHS)) || defined(GGML_MUSA_GRAPHS)
 #define USE_CUDA_GRAPH
 #endif
@@ -1205,7 +1204,7 @@ struct ggml_cuda_graph {
     std::vector<node_properties> node_props;
 
     bool is_enabled() const {
-        static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
+        const bool disable_cuda_graphs_due_to_env = getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr;
         return !(disable_due_to_gpu_arch || disable_cuda_graphs_due_to_env);
     }
 #endif
@@ -1369,8 +1368,31 @@ struct ggml_backend_cuda_context {
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    cublasLtHandle_t cublaslt_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
+#endif
 
     int curr_stream_no = 0;
+
+    struct mmq_prequant_cache_entry {
+        ggml_type consumer_type = GGML_TYPE_COUNT;
+        int64_t ne0_padded = 0;
+        int64_t ne1 = 0;
+        int64_t ne2 = 0;
+        int64_t ne3 = 0;
+        std::unique_ptr<ggml_cuda_pool_alloc<char>> storage;
+        char * data = nullptr;
+    };
+
+    std::vector<std::pair<const ggml_tensor *, mmq_prequant_cache_entry>> mmq_prequant_cache;
+    const ggml_tensor * mmq_prequant_target_tensor = nullptr;
+    const ggml_tensor * mmq_prequant_cache_key_tensor = nullptr;
+    ggml_type mmq_prequant_target_consumer_type = GGML_TYPE_COUNT;
+    int64_t mmq_prequant_target_ne0_padded = 0;
+    int64_t mmq_prequant_target_ne1 = 0;
+    int64_t mmq_prequant_target_ne2 = 0;
+    int64_t mmq_prequant_target_ne3 = 0;
+    bool mmq_prequant_target_q8_only = false;
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
@@ -1449,7 +1471,11 @@ struct ggml_backend_cuda_context {
         if (cublas_handles[device] == nullptr) {
             ggml_cuda_set_device(device);
             CUBLAS_CHECK(cublasCreate(&cublas_handles[device]));
-            CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device], CUBLAS_TF32_TENSOR_OP_MATH));
+            if (getenv("GGML_CUDA_FORCE_CUBLAS_COMPUTE_32F") == nullptr) {
+                CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device], CUBLAS_TF32_TENSOR_OP_MATH));
+            } else {
+                CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device], CUBLAS_DEFAULT_MATH));
+            }
         }
         return cublas_handles[device];
     }
@@ -1457,6 +1483,20 @@ struct ggml_backend_cuda_context {
     cublasHandle_t cublas_handle() {
         return cublas_handle(device);
     }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    cublasLtHandle_t cublaslt_handle(int device) {
+        if (cublaslt_handles[device] == nullptr) {
+            ggml_cuda_set_device(device);
+            CUBLAS_CHECK(cublasLtCreate(&cublaslt_handles[device]));
+        }
+        return cublaslt_handles[device];
+    }
+
+    cublasLtHandle_t cublaslt_handle() {
+        return cublaslt_handle(device);
+    }
+#endif
 
     // pool
     std::unique_ptr<ggml_cuda_pool> pools[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS];
@@ -1473,6 +1513,7 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pool & pool() {
         return pool(device);
     }
+
 };
 
 struct ggml_cuda_mm_fusion_args_host {
@@ -1485,5 +1526,11 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
     const void * gate = nullptr;
     const void * gate_bias = nullptr;
+    uint32_t x_bias_stride_col = 0;
+    uint32_t x_bias_stride_channel = 0;
+    uint32_t x_bias_stride_sample = 0;
+    uint32_t gate_bias_stride_col = 0;
+    uint32_t gate_bias_stride_channel = 0;
+    uint32_t gate_bias_stride_sample = 0;
     ggml_glu_op glu_op;
 };

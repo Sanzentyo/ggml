@@ -453,24 +453,24 @@ static __global__ void mul_mat_vec_q(
     if constexpr (has_fusion) {
         const uint32_t channel_bias = ids ? channel_x : channel_dst;
         if (use_bias) {
-            x_bias = x_bias + sample_dst*stride_sample_dst + channel_bias*stride_channel_dst + row0;
+            x_bias = x_bias + sample_dst*fusion.x_bias_stride_sample + channel_bias*fusion.x_bias_stride_channel + row0;
             // 1. Hide latency by prefetching bias and gate here
             // 2. load only on threads that won't die after partial sum calculation
             if (threadIdx.x < rows_per_cuda_block && threadIdx.y == 0 &&
                 (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < stride_col_dst)) {
 #pragma unroll
                 for (int j = 0; j < ncols_dst; ++j) {
-                    x_biases[j] = x_bias[j * stride_col_dst + threadIdx.x];
+                    x_biases[j] = x_bias[j * fusion.x_bias_stride_col + threadIdx.x];
                 }
             }
         }
         if (use_gate_bias) {
-            gate_bias = gate_bias + sample_dst*stride_sample_dst + channel_bias*stride_channel_dst + row0;
+            gate_bias = gate_bias + sample_dst*fusion.gate_bias_stride_sample + channel_bias*fusion.gate_bias_stride_channel + row0;
             if (threadIdx.x < rows_per_cuda_block && threadIdx.y == 0 &&
                 (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < stride_col_dst)) {
 #pragma unroll
                 for (int j = 0; j < ncols_dst; ++j) {
-                    gate_biases[j] = gate_bias[j * stride_col_dst + threadIdx.x];
+                    gate_biases[j] = gate_bias[j * fusion.gate_bias_stride_col + threadIdx.x];
                 }
             }
         }
@@ -1059,13 +1059,19 @@ void ggml_cuda_mul_mat_vec_q(
 
     if (fusion) {
         GGML_ASSERT( !ids || dst->ne[2] == 1);
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        GGML_ASSERT(  ids || dst->ne[1] <= MMVQ_MAX_BATCH_SIZE);
 
         if (fusion->x_bias) {
             GGML_ASSERT(fusion->x_bias->type == GGML_TYPE_F32);
             GGML_ASSERT(fusion->x_bias->ne[0] == dst->ne[0]);
+            GGML_ASSERT(ids || fusion->x_bias->ne[1] == 1 || fusion->x_bias->ne[1] == dst->ne[1]);
+            GGML_ASSERT(fusion->x_bias->ne[2] == 1 || fusion->x_bias->ne[2] == dst->ne[2]);
+            GGML_ASSERT(fusion->x_bias->ne[3] == 1 || fusion->x_bias->ne[3] == dst->ne[3]);
             GGML_ASSERT(!ids || fusion->x_bias->ne[1] == src0->ne[2]);
             fusion_local.x_bias = fusion->x_bias->data;
+            fusion_local.x_bias_stride_col = fusion->x_bias->ne[1] == 1 ? 0 : fusion->x_bias->nb[1] / ggml_element_size(fusion->x_bias);
+            fusion_local.x_bias_stride_channel = fusion->x_bias->ne[2] == 1 ? 0 : fusion->x_bias->nb[2] / ggml_element_size(fusion->x_bias);
+            fusion_local.x_bias_stride_sample = fusion->x_bias->ne[3] == 1 ? 0 : fusion->x_bias->nb[3] / ggml_element_size(fusion->x_bias);
         }
         if (fusion->gate) {
             GGML_ASSERT(fusion->gate->type == src0->type && ggml_are_same_stride(fusion->gate, src0));
@@ -1074,8 +1080,14 @@ void ggml_cuda_mul_mat_vec_q(
         if (fusion->gate_bias) {
             GGML_ASSERT(fusion->gate_bias->type == GGML_TYPE_F32);
             GGML_ASSERT(fusion->gate_bias->ne[0] == dst->ne[0]);
+            GGML_ASSERT(ids || fusion->gate_bias->ne[1] == 1 || fusion->gate_bias->ne[1] == dst->ne[1]);
+            GGML_ASSERT(fusion->gate_bias->ne[2] == 1 || fusion->gate_bias->ne[2] == dst->ne[2]);
+            GGML_ASSERT(fusion->gate_bias->ne[3] == 1 || fusion->gate_bias->ne[3] == dst->ne[3]);
             GGML_ASSERT(!ids || fusion->gate_bias->ne[1] == src0->ne[2]);
             fusion_local.gate_bias = fusion->gate_bias->data;
+            fusion_local.gate_bias_stride_col = fusion->gate_bias->ne[1] == 1 ? 0 : fusion->gate_bias->nb[1] / ggml_element_size(fusion->gate_bias);
+            fusion_local.gate_bias_stride_channel = fusion->gate_bias->ne[2] == 1 ? 0 : fusion->gate_bias->nb[2] / ggml_element_size(fusion->gate_bias);
+            fusion_local.gate_bias_stride_sample = fusion->gate_bias->ne[3] == 1 ? 0 : fusion->gate_bias->nb[3] / ggml_element_size(fusion->gate_bias);
         }
         fusion_local.glu_op = fusion->glu_op;
     }

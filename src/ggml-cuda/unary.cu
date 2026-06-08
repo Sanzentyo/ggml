@@ -125,10 +125,27 @@ static __global__ void unary_op_kernel(const T * x, T * dst, const int k) {
     dst[i] = (T)op((float)x[i]);
 }
 
+template <float (*op)(float), typename src_t, typename dst_t>
+static __global__ void unary_cpy_op_kernel(const src_t * x, dst_t * dst, const int k) {
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    dst[i] = (dst_t)op((float)x[i]);
+}
+
 template <float (*op)(float), typename T>
 static void unary_cuda(const T * x, T * dst, const int k, cudaStream_t stream) {
     const int num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
     unary_op_kernel<op><<<num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream>>>(x, dst, k);
+}
+
+template <float (*op)(float), typename src_t, typename dst_t>
+static void unary_cpy_cuda(const src_t * x, dst_t * dst, const int k, cudaStream_t stream) {
+    const int num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+    unary_cpy_op_kernel<op><<<num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream>>>(x, dst, k);
 }
 
 template <float (*op)(float)>
@@ -140,14 +157,50 @@ void ggml_cuda_op_unary(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     GGML_ASSERT(ggml_is_contiguous(src0));
 
-    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
-    GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16);
+    GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16 ||  dst->type == GGML_TYPE_BF16);
     GGML_ASSERT(src0->type == dst->type);
 
     if (src0->type == GGML_TYPE_F16) {
         unary_cuda<op>((const half *)src0_d, (half *)dst_d, ggml_nelements(src0), stream);
+    } else if (src0->type == GGML_TYPE_BF16) {
+        unary_cuda<op>((const nv_bfloat16 *)src0_d, (nv_bfloat16 *)dst_d, ggml_nelements(src0), stream);
     } else {
         unary_cuda<op>((const float *)src0_d, (float *)dst_d, ggml_nelements(src0), stream);
+    }
+}
+
+template <float (*op)(float)>
+static void ggml_cuda_op_unary_cpy_impl(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * cpy_node) {
+    const ggml_tensor * src0 = unary_node->src[0];
+    const ggml_tensor * dst  = cpy_node->src[1];
+    const void * src0_d = src0->data;
+    void * dst_d = dst->data;
+    cudaStream_t stream = ctx.stream();
+
+    GGML_ASSERT(cpy_node->op == GGML_OP_CPY);
+    GGML_ASSERT(cpy_node->src[0] == unary_node);
+    GGML_ASSERT(dst == cpy_node);
+    GGML_ASSERT(ggml_is_contiguous(src0));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_nelements(src0) == ggml_nelements(dst));
+
+    if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_BF16) {
+        unary_cpy_cuda<op>((const float *)src0_d, (nv_bfloat16 *)dst_d, ggml_nelements(src0), stream);
+    } else if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16) {
+        unary_cpy_cuda<op>((const float *)src0_d, (half *)dst_d, ggml_nelements(src0), stream);
+    } else {
+        GGML_ABORT("unsupported fused unary cpy: %s -> %s", ggml_type_name(src0->type), ggml_type_name(dst->type));
+    }
+}
+
+void ggml_cuda_op_unary_cpy(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * cpy_node) {
+    switch (ggml_get_unary_op(unary_node)) {
+        case GGML_UNARY_OP_GELU_ERF:
+            ggml_cuda_op_unary_cpy_impl<op_gelu_erf>(ctx, unary_node, cpy_node);
+            break;
+        default:
+            GGML_ABORT("unsupported fused unary cpy op");
     }
 }
 
