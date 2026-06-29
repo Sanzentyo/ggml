@@ -3863,6 +3863,95 @@ static bool ggml_cuda_matches_csv_substring(const char* name, const char* csv) {
     return false;
 }
 
+static int ggml_cuda_sam3_vit_block_index_from_name(const char* name) {
+    if (name == nullptr) {
+        return -1;
+    }
+    constexpr const char* marker = "vit.blocks.";
+    const char* block = std::strstr(name, marker);
+    if (block == nullptr) {
+        return -1;
+    }
+    block += std::strlen(marker);
+    const char* end = block + std::strlen(block);
+    int block_index = -1;
+    const auto result = std::from_chars(block, end, block_index);
+    if (result.ec != std::errc{} || result.ptr == block || result.ptr == end ||
+        *result.ptr != '.') {
+        return -1;
+    }
+    return block_index;
+}
+
+static bool ggml_cuda_int_selector_contains(const char* selector, const int value) {
+    if (selector == nullptr || value < 0) {
+        return false;
+    }
+
+    const char* token = selector;
+    while (*token != '\0') {
+        while (*token == ',' || *token == ' ' || *token == '\t') {
+            ++token;
+        }
+        const char* end = token;
+        while (*end != '\0' && *end != ',') {
+            ++end;
+        }
+        const char* trimmed_end = end;
+        while (trimmed_end > token &&
+               (trimmed_end[-1] == ' ' || trimmed_end[-1] == '\t')) {
+            --trimmed_end;
+        }
+
+        int first = -1;
+        auto first_result = std::from_chars(token, trimmed_end, first);
+        if (first_result.ec == std::errc{} && first_result.ptr != token) {
+            int last = first;
+            const char* cursor = first_result.ptr;
+            while (cursor < trimmed_end && (*cursor == ' ' || *cursor == '\t')) {
+                ++cursor;
+            }
+            if (cursor < trimmed_end && *cursor == '-') {
+                ++cursor;
+                while (cursor < trimmed_end && (*cursor == ' ' || *cursor == '\t')) {
+                    ++cursor;
+                }
+                auto last_result = std::from_chars(cursor, trimmed_end, last);
+                if (last_result.ec != std::errc{} || last_result.ptr == cursor) {
+                    token = *end == ',' ? end + 1 : end;
+                    continue;
+                }
+            }
+            if (first > last) {
+                std::swap(first, last);
+            }
+            if (value >= first && value <= last) {
+                return true;
+            }
+        }
+
+        token = *end == ',' ? end + 1 : end;
+    }
+    return false;
+}
+
+static bool ggml_cuda_cublaslt_bias_residual_fusion_enabled_for(const ggml_tensor* src0) {
+    const char* global = getenv("GGML_CUDA_ENABLE_CUBLASLT_BIAS_RESIDUAL_FUSION");
+    if (global != nullptr && std::atoi(global) != 0) {
+        return true;
+    }
+    if (src0 == nullptr) {
+        return false;
+    }
+    const char* match = getenv("GGML_CUDA_ENABLE_CUBLASLT_BIAS_RESIDUAL_FUSION_MATCH");
+    if (ggml_cuda_matches_csv_substring(src0->name, match)) {
+        return true;
+    }
+    const char* blocks = getenv("GGML_CUDA_ENABLE_CUBLASLT_BIAS_RESIDUAL_FUSION_BLOCKS");
+    return ggml_cuda_int_selector_contains(
+        blocks, ggml_cuda_sam3_vit_block_index_from_name(src0->name));
+}
+
 static bool ggml_cuda_cublaslt_bias_fusion_disabled_for(const ggml_tensor* bias) {
     const char* match = getenv("GGML_CUDA_DISABLE_CUBLASLT_BIAS_FUSION_MATCH");
     return match != nullptr && bias != nullptr &&
@@ -7686,9 +7775,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context* cuda_ctx, ggml_cgraph* 
     static const bool enable_cublaslt_bias_fusion = cublaslt_bias_fusion_mode != 0;
     static const bool enable_cublaslt_bias_gelu_fusion =
         ggml_cuda_cublaslt_bias_gelu_fusion_enabled();
-    static const bool enable_cublaslt_bias_residual_fusion =
-        getenv("GGML_CUDA_ENABLE_CUBLASLT_BIAS_RESIDUAL_FUSION") != nullptr &&
-        std::atoi(getenv("GGML_CUDA_ENABLE_CUBLASLT_BIAS_RESIDUAL_FUSION")) != 0;
     static const bool enable_cudnn_mlp_fc1_gelu_bf16 =
         getenv("GGML_CUDA_ENABLE_CUDNN_MLP_FC1_GELU_BF16") != nullptr &&
         std::atoi(getenv("GGML_CUDA_ENABLE_CUDNN_MLP_FC1_GELU_BF16")) != 0;
@@ -7819,11 +7905,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context* cuda_ctx, ggml_cgraph* 
                     ggml_cuda_unary_can_consume_bias_view(
                         unary_node, bias_node, /*allow_output_type_change=*/true);
                 const bool fuse_gelu = cublaslt_fuse_gelu || cudnn_fuse_gelu;
-                const bool maybe_vit_mlp_fc2_residual =
+                const bool maybe_vit_residual =
                     strstr(src0->name, "vit.blocks.") != nullptr &&
-                    strstr(src0->name, ".mlp.lin2.") != nullptr;
+                    (strstr(src0->name, ".mlp.lin2.") != nullptr ||
+                     strstr(src0->name, ".attn.proj.") != nullptr);
+                const bool enable_cublaslt_bias_residual_fusion =
+                    maybe_vit_residual &&
+                    ggml_cuda_cublaslt_bias_residual_fusion_enabled_for(src0);
                 const int add_idx =
-                    !fuse_gelu && enable_cublaslt_bias_residual_fusion && maybe_vit_mlp_fc2_residual
+                    !fuse_gelu && enable_cublaslt_bias_residual_fusion && maybe_vit_residual
                         ? ggml_cuda_next_nontrivial_node(cgraph, bias_idx + 1)
                         : -1;
                 ggml_tensor* add_node =
@@ -7841,7 +7931,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context* cuda_ctx, ggml_cgraph* 
                     } else if (src1_is_product) {
                         residual_node = add_node->src[0];
                     }
-                    if (maybe_vit_mlp_fc2_residual &&
+                    if (maybe_vit_residual &&
                         getenv("GGML_CUDA_PROFILE_CUBLASLT_BIAS_FUSION") != nullptr) {
                         fprintf(stderr,
                                 "GGML_CUDA_CUBLASLT_BIAS_RESIDUAL probe mm=%s bias=%s add=%s "
@@ -7871,7 +7961,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context* cuda_ctx, ggml_cgraph* 
                         residual_layout_ok &&
                         ggml_cuda_should_fuse_mul_mat_f_batched_cublaslt_bias_tf32(
                             mm_node, bias_tensor, add_node);
-                    if (maybe_vit_mlp_fc2_residual &&
+                    if (maybe_vit_residual &&
                         getenv("GGML_CUDA_PROFILE_CUBLASLT_BIAS_FUSION") != nullptr) {
                         fprintf(
                             stderr,
@@ -7901,7 +7991,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context* cuda_ctx, ggml_cgraph* 
                                                          false,
                                                          fuse_residual ? residual_node : nullptr);
                 if (!memory_ok && fuse_residual) {
-                    if (maybe_vit_mlp_fc2_residual &&
+                    if (maybe_vit_residual &&
                         getenv("GGML_CUDA_PROFILE_CUBLASLT_BIAS_FUSION") != nullptr) {
                         fprintf(stderr,
                                 "GGML_CUDA_CUBLASLT_BIAS_RESIDUAL reject-memory mm=%s "
@@ -7918,7 +8008,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context* cuda_ctx, ggml_cgraph* 
                         ggml_cuda_check_fusion_memory_ranges(cgraph, i, node_count, out_nodes, 1);
                 }
                 if (!memory_ok) {
-                    if (maybe_vit_mlp_fc2_residual &&
+                    if (maybe_vit_residual &&
                         getenv("GGML_CUDA_PROFILE_CUBLASLT_BIAS_FUSION") != nullptr) {
                         fprintf(stderr,
                                 "GGML_CUDA_CUBLASLT_BIAS_RESIDUAL reject-memory mm=%s "
