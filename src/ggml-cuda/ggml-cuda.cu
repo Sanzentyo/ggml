@@ -3246,6 +3246,11 @@ static bool ggml_cuda_env_enabled(const char* name) {
     return value != nullptr && std::atoi(value) != 0;
 }
 
+static bool ggml_cuda_is_vit_mlp_fc1_weight(const ggml_tensor* tensor) {
+    return tensor != nullptr && std::strstr(tensor->name, "vit.blocks.") != nullptr &&
+           std::strstr(tensor->name, ".mlp.lin1.") != nullptr;
+}
+
 static cublasComputeType_t ggml_cuda_cublaslt_bias_compute_type(bool src0_f32,
                                                                 bool use_f16_inputs,
                                                                 bool use_bf16_inputs) {
@@ -3898,8 +3903,7 @@ static bool ggml_cuda_int_selector_contains(const char* selector, const int valu
             ++end;
         }
         const char* trimmed_end = end;
-        while (trimmed_end > token &&
-               (trimmed_end[-1] == ' ' || trimmed_end[-1] == '\t')) {
+        while (trimmed_end > token && (trimmed_end[-1] == ' ' || trimmed_end[-1] == '\t')) {
             --trimmed_end;
         }
 
@@ -3948,8 +3952,8 @@ static bool ggml_cuda_cublaslt_bias_residual_fusion_enabled_for(const ggml_tenso
         return true;
     }
     const char* blocks = getenv("GGML_CUDA_ENABLE_CUBLASLT_BIAS_RESIDUAL_FUSION_BLOCKS");
-    return ggml_cuda_int_selector_contains(
-        blocks, ggml_cuda_sam3_vit_block_index_from_name(src0->name));
+    return ggml_cuda_int_selector_contains(blocks,
+                                           ggml_cuda_sam3_vit_block_index_from_name(src0->name));
 }
 
 static bool ggml_cuda_cublaslt_bias_fusion_disabled_for(const ggml_tensor* bias) {
@@ -6869,9 +6873,8 @@ static bool ggml_cuda_can_fuse_add_norm_affine_preserve_nonseq(const ggml_cgraph
     }
 
     const bool mixed_rhs = add_input->src[1]->type != GGML_TYPE_F32;
-    if (mixed_rhs &&
-        (ggml_cuda_tensors_overlap(add_input, add_input->src[1]) ||
-         ggml_cuda_tensors_overlap(cgraph->nodes[idxs[3]], add_input->src[1]))) {
+    if (mixed_rhs && (ggml_cuda_tensors_overlap(add_input, add_input->src[1]) ||
+                      ggml_cuda_tensors_overlap(cgraph->nodes[idxs[3]], add_input->src[1]))) {
         return false;
     }
 
@@ -6900,11 +6903,11 @@ static bool ggml_cuda_can_fuse_add_norm_affine_shapes(const ggml_cgraph* cgraph,
         std::atoi(getenv("GGML_CUDA_ENABLE_MIXED_ADD_NORM_FUSION")) != 0;
     const bool add_rhs_supported =
         add_input->src[1]->type == GGML_TYPE_F32 ||
-        (enable_mixed_add_norm_fusion && (add_input->src[1]->type == GGML_TYPE_BF16 ||
-                                          add_input->src[1]->type == GGML_TYPE_F16));
+        (enable_mixed_add_norm_fusion &&
+         (add_input->src[1]->type == GGML_TYPE_BF16 || add_input->src[1]->type == GGML_TYPE_F16));
     if (add_input->type != GGML_TYPE_F32 || add_input->src[0]->type != GGML_TYPE_F32 ||
-        !add_rhs_supported || norm->type != GGML_TYPE_F32 ||
-        mul->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32) {
+        !add_rhs_supported || norm->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
+        add->type != GGML_TYPE_F32) {
         return false;
     }
 
@@ -7775,12 +7778,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context* cuda_ctx, ggml_cgraph* 
     static const bool enable_cublaslt_bias_fusion = cublaslt_bias_fusion_mode != 0;
     static const bool enable_cublaslt_bias_gelu_fusion =
         ggml_cuda_cublaslt_bias_gelu_fusion_enabled();
-    static const bool enable_cudnn_mlp_fc1_gelu_bf16 =
-        getenv("GGML_CUDA_ENABLE_CUDNN_MLP_FC1_GELU_BF16") != nullptr &&
-        std::atoi(getenv("GGML_CUDA_ENABLE_CUDNN_MLP_FC1_GELU_BF16")) != 0;
-    static const bool enable_cudnn_mlp_fc1_gelu_f32 =
-        getenv("GGML_CUDA_ENABLE_CUDNN_MLP_FC1_GELU_F32") != nullptr &&
-        std::atoi(getenv("GGML_CUDA_ENABLE_CUDNN_MLP_FC1_GELU_F32")) != 0;
+    static const bool explicit_cudnn_mlp_fc1_gelu_bf16 =
+        ggml_cuda_env_enabled("GGML_CUDA_ENABLE_CUDNN_MLP_FC1_GELU_BF16");
+    static const bool disable_cudnn_mlp_fc1_gelu_bf16 =
+        ggml_cuda_env_enabled("GGML_CUDA_DISABLE_CUDNN_MLP_FC1_GELU_BF16");
+    static const bool explicit_cudnn_mlp_fc1_gelu_f32 =
+        ggml_cuda_env_enabled("GGML_CUDA_ENABLE_CUDNN_MLP_FC1_GELU_F32");
+    static const bool disable_cudnn_mlp_fc1_gelu_f32 =
+        ggml_cuda_env_enabled("GGML_CUDA_DISABLE_CUDNN_MLP_FC1_GELU_F32");
     for (ggml_op op : {GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID}) {
         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
 
@@ -7835,6 +7840,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context* cuda_ctx, ggml_cgraph* 
         const ggml_tensor* src0 = mm_node->src[0];
         const ggml_tensor* src1 = mm_node->src[1];
         const ggml_tensor* ids = mm_node->src[2];
+        const bool default_cudnn_mlp_fc1_gelu_bf16 = ggml_cuda_is_vit_mlp_fc1_weight(src0);
+        const bool enable_cudnn_mlp_fc1_gelu_bf16 =
+            !disable_cudnn_mlp_fc1_gelu_bf16 &&
+            (explicit_cudnn_mlp_fc1_gelu_bf16 || default_cudnn_mlp_fc1_gelu_bf16);
+        const bool enable_cudnn_mlp_fc1_gelu_f32 =
+            !disable_cudnn_mlp_fc1_gelu_f32 && explicit_cudnn_mlp_fc1_gelu_f32;
 
         if (bias_op == GGML_OP_ADD_ID && bias_node->src[2] != ids) {
             continue;
@@ -7870,9 +7881,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context* cuda_ctx, ggml_cgraph* 
                     const int alias_idx = unary_idx;
                     ggml_tensor* alias_node = cgraph->nodes[alias_idx];
                     const int next_idx = ggml_cuda_next_nontrivial_node(cgraph, alias_idx + 1);
-                    ggml_tensor* next_node =
-                        next_idx >= 0 && next_idx < cgraph->n_nodes ? cgraph->nodes[next_idx]
-                                                                     : nullptr;
+                    ggml_tensor* next_node = next_idx >= 0 && next_idx < cgraph->n_nodes
+                                                 ? cgraph->nodes[next_idx]
+                                                 : nullptr;
                     if ((alias_node->op == GGML_OP_RESHAPE || alias_node->op == GGML_OP_VIEW) &&
                         next_node != nullptr && next_node->op == GGML_OP_UNARY &&
                         next_node->src[0] == alias_node) {
@@ -7886,10 +7897,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context* cuda_ctx, ggml_cgraph* 
                       ggml_get_unary_op(unary_node) == GGML_UNARY_OP_GELU) ||
                      (ggml_cuda_cublaslt_bias_gelu_erf_fusion_enabled() &&
                       ggml_get_unary_op(unary_node) == GGML_UNARY_OP_GELU_ERF) ||
-                     (((enable_cudnn_mlp_fc1_gelu_bf16 &&
-                        unary_node->type == GGML_TYPE_BF16) ||
-                       (enable_cudnn_mlp_fc1_gelu_f32 &&
-                        unary_node->type == GGML_TYPE_F32)) &&
+                     (((enable_cudnn_mlp_fc1_gelu_bf16 && unary_node->type == GGML_TYPE_BF16) ||
+                       (enable_cudnn_mlp_fc1_gelu_f32 && unary_node->type == GGML_TYPE_F32)) &&
                       ggml_get_unary_op(unary_node) == GGML_UNARY_OP_GELU_ERF));
                 const bool cublaslt_fuse_gelu =
                     gelu_unary_ok && ggml_cuda_unary_can_consume_bias_view(unary_node, bias_node) &&
@@ -7898,20 +7907,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context* cuda_ctx, ggml_cgraph* 
                 const bool cudnn_fuse_gelu =
                     unary_node != nullptr && unary_node->op == GGML_OP_UNARY &&
                     ggml_get_unary_op(unary_node) == GGML_UNARY_OP_GELU_ERF &&
-                    ((enable_cudnn_mlp_fc1_gelu_bf16 &&
-                      unary_node->type == GGML_TYPE_BF16) ||
-                     (enable_cudnn_mlp_fc1_gelu_f32 &&
-                      unary_node->type == GGML_TYPE_F32)) &&
+                    ((enable_cudnn_mlp_fc1_gelu_bf16 && unary_node->type == GGML_TYPE_BF16) ||
+                     (enable_cudnn_mlp_fc1_gelu_f32 && unary_node->type == GGML_TYPE_F32)) &&
                     ggml_cuda_unary_can_consume_bias_view(
                         unary_node, bias_node, /*allow_output_type_change=*/true);
                 const bool fuse_gelu = cublaslt_fuse_gelu || cudnn_fuse_gelu;
-                const bool maybe_vit_residual =
-                    strstr(src0->name, "vit.blocks.") != nullptr &&
-                    (strstr(src0->name, ".mlp.lin2.") != nullptr ||
-                     strstr(src0->name, ".attn.proj.") != nullptr);
+                const bool maybe_vit_residual = strstr(src0->name, "vit.blocks.") != nullptr &&
+                                                (strstr(src0->name, ".mlp.lin2.") != nullptr ||
+                                                 strstr(src0->name, ".attn.proj.") != nullptr);
                 const bool enable_cublaslt_bias_residual_fusion =
-                    maybe_vit_residual &&
-                    ggml_cuda_cublaslt_bias_residual_fusion_enabled_for(src0);
+                    maybe_vit_residual && ggml_cuda_cublaslt_bias_residual_fusion_enabled_for(src0);
                 const int add_idx =
                     !fuse_gelu && enable_cublaslt_bias_residual_fusion && maybe_vit_residual
                         ? ggml_cuda_next_nontrivial_node(cgraph, bias_idx + 1)
@@ -8020,11 +8025,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context* cuda_ctx, ggml_cgraph* 
                     continue;
                 }
 #ifdef GGML_CUDA_USE_CUDNN_SDPA
-                if (cudnn_fuse_gelu &&
-                    (ggml_cuda_cudnn_mlp_fc1_gelu_bf16(
-                         *cuda_ctx, mm_node, bias_tensor, unary_node) ||
-                     ggml_cuda_cudnn_mlp_fc1_gelu_f32(
-                         *cuda_ctx, mm_node, bias_tensor, unary_node))) {
+                if (cudnn_fuse_gelu && (ggml_cuda_cudnn_mlp_fc1_gelu_bf16(
+                                            *cuda_ctx, mm_node, bias_tensor, unary_node) ||
+                                        ggml_cuda_cudnn_mlp_fc1_gelu_f32(
+                                            *cuda_ctx, mm_node, bias_tensor, unary_node))) {
                     fused_mul_mat_vec = true;
                     fused_node_count = node_count;
                     break;
@@ -8034,8 +8038,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context* cuda_ctx, ggml_cgraph* 
                         *cuda_ctx,
                         src0,
                         src1,
-                        cublaslt_fuse_gelu ? unary_node
-                                           : (fuse_residual ? add_node : bias_node),
+                        cublaslt_fuse_gelu ? unary_node : (fuse_residual ? add_node : bias_node),
                         bias_tensor,
                         cublaslt_fuse_gelu,
                         residual_node)) {

@@ -194,6 +194,11 @@ static const char* output_suffix(ggml_type output_type) {
     return output_type == GGML_TYPE_F32 ? "F32" : "BF16";
 }
 
+static bool env_enabled(const char* name) {
+    const char* value = std::getenv(name);
+    return value != nullptr && std::atoi(value) != 0;
+}
+
 static bool should_log(ggml_type output_type) {
     if (std::getenv("GGML_CUDA_PROFILE_CUDNN_MLP_FC1_GELU") != nullptr) {
         return true;
@@ -283,8 +288,15 @@ static bool ggml_cuda_cudnn_mlp_fc1_gelu(ggml_backend_cuda_context& ctx,
                                          ggml_tensor* dst,
                                          ggml_type output_type,
                                          const char* enable_env,
-                                         const char* unsafe_env) {
-    if (std::getenv(enable_env) == nullptr || std::getenv(unsafe_env) == nullptr) {
+                                         const char* unsafe_env,
+                                         const char* disable_env) {
+    if (env_enabled(disable_env)) {
+        return false;
+    }
+    const bool default_enabled = output_type == GGML_TYPE_BF16;
+    const bool explicit_enabled = env_enabled(enable_env);
+    const bool unsafe_enabled = env_enabled(unsafe_env);
+    if (!default_enabled && (!explicit_enabled || !unsafe_enabled)) {
         return false;
     }
     if (!is_supported_shape(mm_node, bias, dst, output_type)) {
@@ -380,7 +392,8 @@ bool ggml_cuda_cudnn_mlp_fc1_gelu_bf16(ggml_backend_cuda_context& ctx,
                                         dst,
                                         GGML_TYPE_BF16,
                                         "GGML_CUDA_ENABLE_CUDNN_MLP_FC1_GELU_BF16",
-                                        "GGML_CUDA_ENABLE_CUDNN_MLP_FC1_GELU_BF16_UNSAFE_RUN");
+                                        "GGML_CUDA_ENABLE_CUDNN_MLP_FC1_GELU_BF16_UNSAFE_RUN",
+                                        "GGML_CUDA_DISABLE_CUDNN_MLP_FC1_GELU_BF16");
 }
 
 bool ggml_cuda_cudnn_mlp_fc1_gelu_f32(ggml_backend_cuda_context& ctx,
@@ -393,5 +406,6 @@ bool ggml_cuda_cudnn_mlp_fc1_gelu_f32(ggml_backend_cuda_context& ctx,
                                         dst,
                                         GGML_TYPE_F32,
                                         "GGML_CUDA_ENABLE_CUDNN_MLP_FC1_GELU_F32",
-                                        "GGML_CUDA_ENABLE_CUDNN_MLP_FC1_GELU_F32_UNSAFE_RUN");
+                                        "GGML_CUDA_ENABLE_CUDNN_MLP_FC1_GELU_F32_UNSAFE_RUN",
+                                        "GGML_CUDA_DISABLE_CUDNN_MLP_FC1_GELU_F32");
 }
