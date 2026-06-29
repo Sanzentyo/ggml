@@ -33,6 +33,7 @@ static __global__ void cpy_scalar(const char* cx,
                                   const int64_t nb11,
                                   const int64_t nb12,
                                   const int64_t nb13) {
+    ggml_cuda_pdl_lc();
     const int64_t i = (int64_t) blockDim.x * blockIdx.x + threadIdx.x;
 
     if (i >= ne) {
@@ -54,6 +55,7 @@ static __global__ void cpy_scalar(const char* cx,
     const int64_t i10 = i - i13 * ne10 * ne11 * ne12 - i12 * ne10 * ne11 - i11 * ne10;
     const int64_t dst_offset = i10 * nb10 + i11 * nb11 + i12 * nb12 + i13 * nb13;
 
+    ggml_cuda_pdl_sync();
     cpy_1(cx + x_offset, cdst + dst_offset);
 }
 
@@ -312,6 +314,7 @@ static __global__ void cpy_scalar_transpose(const char* cx,
     __shared__ float tile[2][CUDA_CPY_TILE_DIM_2D][CUDA_CPY_TILE_DIM_2D + 1];
     int cur_tile_buf = 0;
 
+    ggml_cuda_pdl_sync();
 #pragma unroll
     for (int i = 0; i < CUDA_CPY_BLOCK_NM; ++i) {
         const unsigned int imat = blockIdx.z * CUDA_CPY_BLOCK_NM + i;
@@ -406,6 +409,7 @@ static __global__ void cpy_f32_q(const char* cx,
     const int64_t i10 = i - i13 * ne10 * ne11 * ne12 - i12 * ne10 * ne11 - i11 * ne10;
     const int64_t dst_offset = (i10 / qk) * nb10 + i11 * nb11 + i12 * nb12 + i13 * nb13;
 
+    ggml_cuda_pdl_sync();
     cpy_blck(cx + x_offset, cdst + dst_offset);
 }
 
@@ -445,6 +449,7 @@ static __global__ void cpy_q_f32(const char* cx,
     const int64_t i10 = i - i13 * ne10 * ne11 * ne12 - i12 * ne10 * ne11 - i11 * ne10;
     const int64_t dst_offset = i10 * nb10 + i11 * nb11 + i12 * nb12 + i13 * nb13;
 
+    ggml_cuda_pdl_sync();
     cpy_blck(cx + x_offset, cdst + dst_offset);
 }
 
@@ -459,6 +464,7 @@ static __global__ void cpy_scalar_contiguous(const char* cx, char* cdst, const i
     const src_t* x = (const src_t*) cx;
     dst_t* dst = (dst_t*) cdst;
 
+    ggml_cuda_pdl_sync();
     dst[i] = ggml_cuda_cast<dst_t>(x[i]);
 }
 
@@ -472,6 +478,7 @@ static __global__ void cpy_f32_to_lowp_contiguous_vec4(const float4* cx,
         return;
     }
 
+    ggml_cuda_pdl_sync();
     const float4 x = cx[i];
     cdst[2 * i + 0] = ggml_cuda_cast<dst2_t>(make_float2(x.x, x.y));
     cdst[2 * i + 1] = ggml_cuda_cast<dst2_t>(make_float2(x.z, x.w));
@@ -494,8 +501,9 @@ static void ggml_cpy_f32_to_lowp_contiguous_vec4_cuda(const char* cx,
     const int64_t ne4 = ne / 4;
     const int64_t num_blocks = (ne4 + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
     GGML_ASSERT(num_blocks < UINT_MAX);
-    cpy_f32_to_lowp_contiguous_vec4<dst2_t>
-        <<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>((const float4*) cx, (dst2_t*) cdst, ne4);
+    const ggml_cuda_kernel_launch_params launch_params =
+        ggml_cuda_kernel_launch_params((dim3) num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream);
+    ggml_cuda_kernel_launch(cpy_f32_to_lowp_contiguous_vec4<dst2_t>, launch_params, (const float4*) cx, (dst2_t*) cdst, ne4);
 }
 
 template <typename src_t, typename dst_t>
@@ -505,8 +513,9 @@ static void ggml_cpy_scalar_contiguous_cuda(const char* cx,
                                             cudaStream_t stream) {
     const int64_t num_blocks = (ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
     GGML_ASSERT(num_blocks < UINT_MAX);
-    cpy_scalar_contiguous<src_t, dst_t>
-        <<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>(cx, cdst, ne);
+    const ggml_cuda_kernel_launch_params launch_params =
+        ggml_cuda_kernel_launch_params((dim3) num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream);
+    ggml_cuda_kernel_launch(cpy_scalar_contiguous<src_t, dst_t>, launch_params, cx, cdst, ne);
 }
 
 template <typename src_t, typename dst_t, bool transposed = false, bool dst_contiguous = false>
@@ -549,23 +558,26 @@ static void ggml_cpy_scalar_cuda(const char* cx,
         GGML_ASSERT(grid_z < USHRT_MAX);
         dim3 dimGrid(grid_x, grid_y, grid_z);
         dim3 dimBlock(CUDA_CPY_TILE_DIM_2D, CUDA_CPY_BLOCK_ROWS, 1);
-        cpy_scalar_transpose<dst_t><<<dimGrid, dimBlock, 0, stream>>>(cx,
-                                                                      cdst,
-                                                                      ne,
-                                                                      ne00n,
-                                                                      ne01n,
-                                                                      ne02n,
-                                                                      nb00,
-                                                                      nb01,
-                                                                      nb02,
-                                                                      nb03,
-                                                                      ne10,
-                                                                      ne11,
-                                                                      ne12,
-                                                                      nb10,
-                                                                      nb11,
-                                                                      nb12,
-                                                                      nb13);
+        const ggml_cuda_kernel_launch_params launch_params =
+            ggml_cuda_kernel_launch_params(dimGrid, dimBlock, 0, stream);
+        ggml_cuda_kernel_launch(cpy_scalar_transpose<dst_t>, launch_params,
+                                cx,
+                                cdst,
+                                ne,
+                                ne00n,
+                                ne01n,
+                                ne02n,
+                                nb00,
+                                nb01,
+                                nb02,
+                                nb03,
+                                ne10,
+                                ne11,
+                                ne12,
+                                nb10,
+                                nb11,
+                                nb12,
+                                nb13);
     } else if (dst_contiguous) {
         const int64_t nrows = ne / ne00;
         if (ne00 >= 32 && nrows < UINT_MAX &&
@@ -616,24 +628,26 @@ static void ggml_cpy_scalar_cuda(const char* cx,
     } else {
         const int64_t num_blocks = (ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
         GGML_ASSERT(num_blocks < UINT_MAX);
-        cpy_scalar<cpy_1_scalar<src_t, dst_t>>
-            <<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>(cx,
-                                                             cdst,
-                                                             ne,
-                                                             ne00,
-                                                             ne01,
-                                                             ne02,
-                                                             nb00,
-                                                             nb01,
-                                                             nb02,
-                                                             nb03,
-                                                             ne10,
-                                                             ne11,
-                                                             ne12,
-                                                             nb10,
-                                                             nb11,
-                                                             nb12,
-                                                             nb13);
+        const ggml_cuda_kernel_launch_params launch_params =
+            ggml_cuda_kernel_launch_params((dim3) num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream);
+        ggml_cuda_kernel_launch(cpy_scalar<cpy_1_scalar<src_t, dst_t>>, launch_params,
+                                cx,
+                                cdst,
+                                ne,
+                                ne00,
+                                ne01,
+                                ne02,
+                                nb00,
+                                nb01,
+                                nb02,
+                                nb03,
+                                ne10,
+                                ne11,
+                                ne12,
+                                nb10,
+                                nb11,
+                                nb12,
+                                nb13);
     }
 }
 
