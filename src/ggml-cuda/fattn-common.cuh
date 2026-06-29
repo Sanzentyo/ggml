@@ -928,10 +928,209 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+static __global__ void fattn_f32_to_f16_vec2_kernel(const float * __restrict__ src, half * __restrict__ dst, const int64_t n2) {
+    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n2) {
+        return;
+    }
+
+    reinterpret_cast<half2 *>(dst)[i] = __float22half2_rn(reinterpret_cast<const float2 *>(src)[i]);
+}
+
+static __global__ void fattn_f32_to_f16_pair_vec2_kernel(
+        const float * __restrict__ src0, const float * __restrict__ src1,
+        half * __restrict__ dst0, half * __restrict__ dst1, const int64_t n2) {
+    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n2) {
+        return;
+    }
+
+    reinterpret_cast<half2 *>(dst0)[i] = __float22half2_rn(reinterpret_cast<const float2 *>(src0)[i]);
+    reinterpret_cast<half2 *>(dst1)[i] = __float22half2_rn(reinterpret_cast<const float2 *>(src1)[i]);
+}
+
+static __global__ void fattn_f32_to_f16_nc_dim0_vec2_kernel(
+        const float * __restrict__ src, half * __restrict__ dst,
+        const int64_t ne00_half2, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+        const int64_t s01, const int64_t s02, const int64_t s03, const int64_t n2) {
+    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n2) {
+        return;
+    }
+
+    const int64_t i00h = i % ne00_half2;
+    int64_t rem = i / ne00_half2;
+    const int64_t i01 = rem % ne01;
+    rem /= ne01;
+    const int64_t i02 = rem % ne02;
+    const int64_t i03 = rem / ne02;
+
+    if (i03 >= ne03) {
+        return;
+    }
+
+    const int64_t src_i = i03*s03 + i02*s02 + i01*s01 + 2*i00h;
+    reinterpret_cast<half2 *>(dst)[i] = __float22half2_rn(reinterpret_cast<const float2 *>(src)[src_i / 2]);
+}
+
+static __global__ void fattn_f32_to_f16_nc_dim0_vec4_kernel(
+        const float * __restrict__ src, half * __restrict__ dst,
+        const int64_t ne00_float4, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+        const int64_t s01, const int64_t s02, const int64_t s03, const int64_t n4) {
+    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n4) {
+        return;
+    }
+
+    const int64_t i00q = i % ne00_float4;
+    int64_t rem = i / ne00_float4;
+    const int64_t i01 = rem % ne01;
+    rem /= ne01;
+    const int64_t i02 = rem % ne02;
+    const int64_t i03 = rem / ne02;
+
+    if (i03 >= ne03) {
+        return;
+    }
+
+    const int64_t src_i = i03*s03 + i02*s02 + i01*s01 + 4*i00q;
+    const float4 v = reinterpret_cast<const float4 *>(src)[src_i / 4];
+    half2 * dst_h2 = reinterpret_cast<half2 *>(dst);
+    dst_h2[2*i + 0] = __float22half2_rn(make_float2(v.x, v.y));
+    dst_h2[2*i + 1] = __float22half2_rn(make_float2(v.z, v.w));
+}
+
+static bool fattn_can_use_f32_to_f16_vec2(const ggml_tensor * tensor, const char * data, const half * dst) {
+    return tensor->type == GGML_TYPE_F32 && ggml_is_contiguously_allocated(tensor) && ggml_nelements(tensor) % 2 == 0 &&
+           reinterpret_cast<uintptr_t>(data) % alignof(float2) == 0 &&
+           reinterpret_cast<uintptr_t>(dst) % alignof(half2) == 0 &&
+           getenv("GGML_CUDA_DISABLE_FATTN_F32_TO_F16_VEC2") == nullptr;
+}
+
+static bool fattn_can_use_f32_to_f16_pair_vec2(
+        const ggml_tensor * tensor0, const char * data0, const half * dst0,
+        const ggml_tensor * tensor1, const char * data1, const half * dst1) {
+    return getenv("GGML_CUDA_ENABLE_FATTN_F32_TO_F16_PAIR_VEC2") != nullptr &&
+           ggml_nelements(tensor0) == ggml_nelements(tensor1) &&
+           fattn_can_use_f32_to_f16_vec2(tensor0, data0, dst0) &&
+           fattn_can_use_f32_to_f16_vec2(tensor1, data1, dst1);
+}
+
+static bool fattn_can_use_f32_to_f16_nc_dim0_vec2(const ggml_tensor * tensor, const char * data, const half * dst) {
+    return tensor->type == GGML_TYPE_F32 &&
+           !ggml_is_contiguously_allocated(tensor) &&
+           tensor->nb[0] == sizeof(float) &&
+           tensor->ne[0] % 2 == 0 &&
+           ggml_nelements(tensor) % 2 == 0 &&
+           reinterpret_cast<uintptr_t>(data) % alignof(float2) == 0 &&
+           reinterpret_cast<uintptr_t>(dst) % alignof(half2) == 0 &&
+           getenv("GGML_CUDA_DISABLE_FATTN_F32_TO_F16_NC_DIM0_VEC2") == nullptr;
+}
+
+static bool fattn_can_use_f32_to_f16_nc_dim0_vec4(const ggml_tensor * tensor,
+                                                  const char * data,
+                                                  const half * dst,
+                                                  const int64_t s01,
+                                                  const int64_t s02,
+                                                  const int64_t s03) {
+    return tensor->type == GGML_TYPE_F32 &&
+           !ggml_is_contiguously_allocated(tensor) &&
+           tensor->nb[0] == sizeof(float) &&
+           tensor->ne[0] % 4 == 0 &&
+           ggml_nelements(tensor) % 4 == 0 &&
+           s01 % 4 == 0 &&
+           s02 % 4 == 0 &&
+           s03 % 4 == 0 &&
+           reinterpret_cast<uintptr_t>(data) % alignof(float4) == 0 &&
+           reinterpret_cast<uintptr_t>(dst) % alignof(half2) == 0 &&
+           getenv("GGML_CUDA_ENABLE_FATTN_F32_TO_F16_NC_DIM0_VEC4") != nullptr;
+}
+
+static void fattn_f32_to_f16_vec2(const char * src, half * dst, const int64_t ne, cudaStream_t stream) {
+    constexpr int block_size = 256;
+    GGML_ASSERT(ne % 2 == 0);
+    GGML_ASSERT(reinterpret_cast<uintptr_t>(src) % alignof(float2) == 0);
+    GGML_ASSERT(reinterpret_cast<uintptr_t>(dst) % alignof(half2) == 0);
+
+    const int64_t n2         = ne / 2;
+    const int64_t num_blocks = (n2 + block_size - 1) / block_size;
+    GGML_ASSERT(num_blocks <= UINT32_MAX);
+
+    fattn_f32_to_f16_vec2_kernel<<<uint32_t(num_blocks), block_size, 0, stream>>>(
+        reinterpret_cast<const float *>(src), dst, n2);
+}
+
+static void fattn_f32_to_f16_pair_vec2(
+        const char * src0, const char * src1, half * dst0, half * dst1, const int64_t ne, cudaStream_t stream) {
+    constexpr int block_size = 256;
+    GGML_ASSERT(ne % 2 == 0);
+    GGML_ASSERT(reinterpret_cast<uintptr_t>(src0) % alignof(float2) == 0);
+    GGML_ASSERT(reinterpret_cast<uintptr_t>(src1) % alignof(float2) == 0);
+    GGML_ASSERT(reinterpret_cast<uintptr_t>(dst0) % alignof(half2) == 0);
+    GGML_ASSERT(reinterpret_cast<uintptr_t>(dst1) % alignof(half2) == 0);
+
+    const int64_t n2         = ne / 2;
+    const int64_t num_blocks = (n2 + block_size - 1) / block_size;
+    GGML_ASSERT(num_blocks <= UINT32_MAX);
+
+    fattn_f32_to_f16_pair_vec2_kernel<<<uint32_t(num_blocks), block_size, 0, stream>>>(
+        reinterpret_cast<const float *>(src0), reinterpret_cast<const float *>(src1), dst0, dst1, n2);
+}
+
+static void fattn_f32_to_f16_nc_dim0_vec2(const char * src,
+                                          half * dst,
+                                          const int64_t ne00,
+                                          const int64_t ne01,
+                                          const int64_t ne02,
+                                          const int64_t ne03,
+                                          const int64_t s01,
+                                          const int64_t s02,
+                                          const int64_t s03,
+                                          cudaStream_t stream) {
+    constexpr int block_size = 256;
+    GGML_ASSERT(ne00 % 2 == 0);
+    GGML_ASSERT(reinterpret_cast<uintptr_t>(src) % alignof(float2) == 0);
+    GGML_ASSERT(reinterpret_cast<uintptr_t>(dst) % alignof(half2) == 0);
+
+    const int64_t n2 = (ne00 / 2) * ne01 * ne02 * ne03;
+    const int64_t num_blocks = (n2 + block_size - 1) / block_size;
+    GGML_ASSERT(num_blocks <= UINT32_MAX);
+
+    fattn_f32_to_f16_nc_dim0_vec2_kernel<<<uint32_t(num_blocks), block_size, 0, stream>>>(
+        reinterpret_cast<const float *>(src), dst, ne00 / 2, ne01, ne02, ne03, s01, s02, s03, n2);
+}
+
+static void fattn_f32_to_f16_nc_dim0_vec4(const char * src,
+                                          half * dst,
+                                          const int64_t ne00,
+                                          const int64_t ne01,
+                                          const int64_t ne02,
+                                          const int64_t ne03,
+                                          const int64_t s01,
+                                          const int64_t s02,
+                                          const int64_t s03,
+                                          cudaStream_t stream) {
+    constexpr int block_size = 256;
+    GGML_ASSERT(ne00 % 4 == 0);
+    GGML_ASSERT(s01 % 4 == 0);
+    GGML_ASSERT(s02 % 4 == 0);
+    GGML_ASSERT(s03 % 4 == 0);
+    GGML_ASSERT(reinterpret_cast<uintptr_t>(src) % alignof(float4) == 0);
+    GGML_ASSERT(reinterpret_cast<uintptr_t>(dst) % alignof(half2) == 0);
+
+    const int64_t n4 = (ne00 / 4) * ne01 * ne02 * ne03;
+    const int64_t num_blocks = (n4 + block_size - 1) / block_size;
+    GGML_ASSERT(num_blocks <= UINT32_MAX);
+
+    fattn_f32_to_f16_nc_dim0_vec4_kernel<<<uint32_t(num_blocks), block_size, 0, stream>>>(
+        reinterpret_cast<const float *>(src), dst, ne00 / 4, ne01, ne02, ne03, s01, s02, s03, n4);
+}
+
 template <int DV, int ncols1, int ncols2, int DV_DST = DV>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
-    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE
+    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE,
+    const bool need_f32_Q = true
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -989,7 +1188,9 @@ void launch_fattn(
     size_t nb02 = Q->nb[2];
     size_t nb03 = Q->nb[3];
 
-    if (Q->type != GGML_TYPE_F32) {
+    GGML_ASSERT(need_f32_Q || Q->type == GGML_TYPE_F16);
+
+    if (need_f32_Q && Q->type != GGML_TYPE_F32) {
         const size_t bs = ggml_blck_size(Q->type);
         const size_t ts = ggml_type_size(Q->type);
 
@@ -1029,31 +1230,63 @@ void launch_fattn(
     size_t nb22 = V->nb[2];
     size_t nb23 = V->nb[3];
 
-    if (need_f16_K && K->type != GGML_TYPE_F16) {
-        const size_t bs = ggml_blck_size(K->type);
-        const size_t ts = ggml_type_size(K->type);
-
+    bool converted_KV_pair = false;
+    if (need_f16_K && need_f16_V && K->type != GGML_TYPE_F16 && V->type != GGML_TYPE_F16 && !V_is_K_view) {
         K_f16.alloc(ggml_nelements(K));
-        if (ggml_is_contiguously_allocated(K)) {
-            to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
-            to_fp16(K_data, K_f16.ptr, ggml_nelements(K), main_stream);
+        V_f16.alloc(ggml_nelements(V));
+        if (fattn_can_use_f32_to_f16_pair_vec2(K, K_data, K_f16.ptr, V, V_data, V_f16.ptr)) {
+            fattn_f32_to_f16_pair_vec2(K_data, V_data, K_f16.ptr, V_f16.ptr, ggml_nelements(K), main_stream);
 
-            nb11 = nb11*bs*sizeof(half)/ts;
-            nb12 = nb12*bs*sizeof(half)/ts;
-            nb13 = nb13*bs*sizeof(half)/ts;
-        } else {
-            GGML_ASSERT(K->nb[0] == ts);
-            to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(K->type);
-            const int64_t s01 = nb11 / ts;
-            const int64_t s02 = nb12 / ts;
-            const int64_t s03 = nb13 / ts;
-            to_fp16(K_data, K_f16.ptr, K->ne[0], K->ne[1], K->ne[2], K->ne[3], s01, s02, s03, main_stream);
+            const size_t k_bs = ggml_blck_size(K->type);
+            const size_t k_ts = ggml_type_size(K->type);
+            nb11 = nb11*k_bs*sizeof(half)/k_ts;
+            nb12 = nb12*k_bs*sizeof(half)/k_ts;
+            nb13 = nb13*k_bs*sizeof(half)/k_ts;
+            K_data = (char *) K_f16.ptr;
 
-            nb11 = K->ne[0] * sizeof(half);
-            nb12 = K->ne[1] * nb11;
-            nb13 = K->ne[2] * nb12;
+            const size_t v_bs = ggml_blck_size(V->type);
+            const size_t v_ts = ggml_type_size(V->type);
+            nb21 = nb21*v_bs*sizeof(half)/v_ts;
+            nb22 = nb22*v_bs*sizeof(half)/v_ts;
+            nb23 = nb23*v_bs*sizeof(half)/v_ts;
+            V_data = (char *) V_f16.ptr;
+            converted_KV_pair = true;
         }
-        K_data = (char *) K_f16.ptr;
+    }
+
+    if (need_f16_K && K->type != GGML_TYPE_F16) {
+        if (!converted_KV_pair) {
+            const size_t bs = ggml_blck_size(K->type);
+            const size_t ts = ggml_type_size(K->type);
+
+            if (K_f16.ptr == nullptr) {
+                K_f16.alloc(ggml_nelements(K));
+            }
+            if (ggml_is_contiguously_allocated(K)) {
+                if (fattn_can_use_f32_to_f16_vec2(K, K_data, K_f16.ptr)) {
+                    fattn_f32_to_f16_vec2(K_data, K_f16.ptr, ggml_nelements(K), main_stream);
+                } else {
+                    to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
+                    to_fp16(K_data, K_f16.ptr, ggml_nelements(K), main_stream);
+                }
+
+                nb11 = nb11*bs*sizeof(half)/ts;
+                nb12 = nb12*bs*sizeof(half)/ts;
+                nb13 = nb13*bs*sizeof(half)/ts;
+            } else {
+                GGML_ASSERT(K->nb[0] == ts);
+                to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(K->type);
+                const int64_t s01 = nb11 / ts;
+                const int64_t s02 = nb12 / ts;
+                const int64_t s03 = nb13 / ts;
+                to_fp16(K_data, K_f16.ptr, K->ne[0], K->ne[1], K->ne[2], K->ne[3], s01, s02, s03, main_stream);
+
+                nb11 = K->ne[0] * sizeof(half);
+                nb12 = K->ne[1] * nb11;
+                nb13 = K->ne[2] * nb12;
+            }
+            K_data = (char *) K_f16.ptr;
+        }
     }
     if (profile_fattn) {
         CUDA_CHECK(cudaEventRecord(profile_after_K, main_stream));
@@ -1065,14 +1298,20 @@ void launch_fattn(
             nb21   = nb11;
             nb22   = nb12;
             nb23   = nb13;
-        } else {
+        } else if (!converted_KV_pair) {
             const size_t bs = ggml_blck_size(V->type);
             const size_t ts = ggml_type_size(V->type);
 
-            V_f16.alloc(ggml_nelements(V));
+            if (V_f16.ptr == nullptr) {
+                V_f16.alloc(ggml_nelements(V));
+            }
             if (ggml_is_contiguously_allocated(V)) {
-                to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
-                to_fp16(V_data, V_f16.ptr, ggml_nelements(V), main_stream);
+                if (fattn_can_use_f32_to_f16_vec2(V, V_data, V_f16.ptr)) {
+                    fattn_f32_to_f16_vec2(V_data, V_f16.ptr, ggml_nelements(V), main_stream);
+                } else {
+                    to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
+                    to_fp16(V_data, V_f16.ptr, ggml_nelements(V), main_stream);
+                }
                 V_data = (char *) V_f16.ptr;
 
                 nb21 = nb21*bs*sizeof(half)/ts;
@@ -1080,11 +1319,35 @@ void launch_fattn(
                 nb23 = nb23*bs*sizeof(half)/ts;
             } else {
                 GGML_ASSERT(V->nb[0] == ts);
-                to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(V->type);
                 const int64_t s01 = nb21 / ts;
                 const int64_t s02 = nb22 / ts;
                 const int64_t s03 = nb23 / ts;
-                to_fp16(V_data, V_f16.ptr, V->ne[0], V->ne[1], V->ne[2], V->ne[3], s01, s02, s03, main_stream);
+                if (fattn_can_use_f32_to_f16_nc_dim0_vec4(V, V_data, V_f16.ptr, s01, s02, s03)) {
+                    fattn_f32_to_f16_nc_dim0_vec4(V_data,
+                                                  V_f16.ptr,
+                                                  V->ne[0],
+                                                  V->ne[1],
+                                                  V->ne[2],
+                                                  V->ne[3],
+                                                  s01,
+                                                  s02,
+                                                  s03,
+                                                  main_stream);
+                } else if (fattn_can_use_f32_to_f16_nc_dim0_vec2(V, V_data, V_f16.ptr)) {
+                    fattn_f32_to_f16_nc_dim0_vec2(V_data,
+                                                  V_f16.ptr,
+                                                  V->ne[0],
+                                                  V->ne[1],
+                                                  V->ne[2],
+                                                  V->ne[3],
+                                                  s01,
+                                                  s02,
+                                                  s03,
+                                                  main_stream);
+                } else {
+                    to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(V->type);
+                    to_fp16(V_data, V_f16.ptr, V->ne[0], V->ne[1], V->ne[2], V->ne[3], s01, s02, s03, main_stream);
+                }
 
                 nb21 = V->ne[0] * sizeof(half);
                 nb22 = V->ne[1] * nb21;
@@ -1139,9 +1402,13 @@ void launch_fattn(
         const int tiles_nwaves = (ntiles_dst + max_blocks - 1) / max_blocks;
         const int tiles_efficiency_percent = 100 * ntiles_dst / (max_blocks*tiles_nwaves);
 
+        const char * force_stream_k_env = getenv("GGML_CUDA_FORCE_FATTN_STREAM_K");
+        const bool force_stream_k = force_stream_k_env != nullptr && force_stream_k_env[0] != '0';
+        const bool enough_output_tiles = ntiles_dst >= max_blocks;
         const bool use_stream_k =
             getenv("GGML_CUDA_DISABLE_FATTN_STREAM_K") == nullptr &&
-            (cc >= GGML_CUDA_CC_ADA_LOVELACE || amd_wmma_available(cc) || tiles_efficiency_percent < 75);
+            (force_stream_k || amd_wmma_available(cc) || tiles_efficiency_percent < 75 ||
+             (cc >= GGML_CUDA_CC_ADA_LOVELACE && !enough_output_tiles));
 
         blocks_num.x = ntiles_dst;
         blocks_num.y = 1;
@@ -1203,6 +1470,12 @@ void launch_fattn(
                 nwaves_best = nwaves;
                 efficiency_percent_best = efficiency_percent;
                 parallel_blocks = parallel_blocks_test;
+            }
+        }
+        if (const char * force_parallel_blocks_env = getenv("GGML_CUDA_FORCE_FATTN_PARALLEL_BLOCKS")) {
+            const int forced_parallel_blocks = atoi(force_parallel_blocks_env);
+            if (forced_parallel_blocks > 0) {
+                parallel_blocks = std::min(forced_parallel_blocks, ntiles_KV);
             }
         }
 
@@ -1325,12 +1598,13 @@ void launch_fattn(
         CUDA_CHECK(cudaEventElapsedTime(&compute_ms, profile_after_V, profile_after_compute));
         CUDA_CHECK(cudaEventElapsedTime(&total_ms, profile_start, profile_after_compute));
         fprintf(stderr,
-                "GGML_CUDA_PROFILE_FATTN Q_convert_ms=%.6f K_convert_ms=%.6f V_convert_ms=%.6f kernel_ms=%.6f fixup_ms=%.6f compute_ms=%.6f "
+                "GGML_CUDA_PROFILE_FATTN name=%s Q_convert_ms=%.6f K_convert_ms=%.6f V_convert_ms=%.6f kernel_ms=%.6f fixup_ms=%.6f compute_ms=%.6f "
                 "total_ms=%.6f need_f16_K=%d need_f16_V=%d stream_k=%d ncols=%d ncols1=%d "
                 "ncols2=%d nbatch_fa=%d parallel_blocks=%d blocks=(%u,%u,%u) "
                 "ntiles_dst=%d ntiles_KV=%d max_blocks_per_sm=%d nsm=%d schedule=%s bpt=%d "
                 "Q=[%lld,%lld,%lld,%lld] K=[%lld,%lld,%lld,%lld] V=[%lld,%lld,%lld,%lld] "
                 "types=%s/%s/%s\n",
+                dst->name,
                 Q_ms,
                 K_ms,
                 V_ms,

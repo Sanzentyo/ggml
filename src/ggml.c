@@ -5594,8 +5594,7 @@ struct ggml_tensor * ggml_win_part(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
         int                   w) {
-    GGML_ASSERT(a->ne[3] == 1);
-    GGML_ASSERT(a->type  == GGML_TYPE_F32);
+    GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16 || a->type == GGML_TYPE_BF16);
 
     // padding
     const int px = (w - a->ne[1]%w)%w;
@@ -5605,8 +5604,8 @@ struct ggml_tensor * ggml_win_part(
     const int npy = (py + a->ne[2])/w;
     const int np  = npx*npy;
 
-    const int64_t ne[4] = { a->ne[0], w, w, np, };
-    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    const int64_t ne[4] = { a->ne[0], w, w, np*a->ne[3], };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, a->type, 4, ne);
 
     int32_t params[] = { npx, npy, w };
     ggml_set_op_params(result, params, sizeof(params));
@@ -5625,10 +5624,17 @@ struct ggml_tensor * ggml_win_unpart(
         int                   w0,
         int                   h0,
         int                   w) {
-    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16 || a->type == GGML_TYPE_BF16);
 
-    const int64_t ne[4] = { a->ne[0], w0, h0, 1, };
-    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 3, ne);
+    const int px = (w - w0%w)%w;
+    const int py = (w - h0%w)%w;
+    const int npx = (px + w0)/w;
+    const int npy = (py + h0)/w;
+    const int np  = npx*npy;
+    GGML_ASSERT(a->ne[3] % np == 0);
+
+    const int64_t ne[4] = { a->ne[0], w0, h0, a->ne[3]/np, };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, a->type, 4, ne);
 
     int32_t params[] = { w };
     ggml_set_op_params(result, params, sizeof(params));

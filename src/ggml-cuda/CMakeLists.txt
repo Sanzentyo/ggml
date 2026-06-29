@@ -102,6 +102,8 @@ if (CUDAToolkit_FOUND)
     list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h")
 
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
+    list(REMOVE_ITEM GGML_SOURCES_CUDA "${CMAKE_CURRENT_LIST_DIR}/cudnn-sdpa.cu")
+    list(REMOVE_ITEM GGML_SOURCES_CUDA "${CMAKE_CURRENT_LIST_DIR}/cudnn-mlp.cu")
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
@@ -121,6 +123,42 @@ if (CUDAToolkit_FOUND)
             template-instances/fattn-vec-instance-q4_0-q4_0.cu
             template-instances/fattn-vec-instance-q8_0-q8_0.cu
             template-instances/fattn-vec-instance-bf16-bf16.cu)
+    endif()
+
+    find_path(CUDNN_FRONTEND_INCLUDE_DIR
+        NAMES cudnn_frontend.h
+        PATHS
+            ${CMAKE_SOURCE_DIR}/external/cudnn-frontend/include
+            ${CMAKE_SOURCE_DIR}/../cudnn-frontend/include
+    )
+    find_path(CUDNN_INCLUDE_DIR
+        NAMES cudnn.h
+        PATHS
+            $ENV{CUDNN_ROOT}/include
+            /usr/include/x86_64-linux-gnu
+            /usr/local/cuda/include
+    )
+    find_library(CUDNN_LIBRARY
+        NAMES cudnn
+        PATHS
+            $ENV{CUDNN_ROOT}/lib
+            $ENV{CUDNN_ROOT}/lib64
+            /usr/lib/x86_64-linux-gnu
+            /usr/local/cuda/lib64
+    )
+
+    if (CUDNN_INCLUDE_DIR AND CUDNN_LIBRARY)
+        set(GGML_CUDA_CUDNN_FOUND ON)
+    else()
+        message(STATUS "cuDNN not found -- disabling ggml-cuda cuDNN ops")
+    endif()
+
+    if (GGML_CUDA_CUDNN_FOUND AND CUDNN_FRONTEND_INCLUDE_DIR)
+        list(APPEND GGML_SOURCES_CUDA "${CMAKE_CURRENT_LIST_DIR}/cudnn-sdpa.cu")
+        list(APPEND GGML_SOURCES_CUDA "${CMAKE_CURRENT_LIST_DIR}/cudnn-mlp.cu")
+        set(GGML_CUDA_CUDNN_SDPA_FOUND ON)
+    else()
+        message(STATUS "cuDNN Frontend or cuDNN not found -- disabling ggml-cuda cuDNN SDPA")
     endif()
 
     ggml_add_backend_library(ggml-cuda
@@ -152,6 +190,27 @@ if (CUDAToolkit_FOUND)
 
     if (GGML_CUDA_NO_PEER_COPY)
         add_compile_definitions(GGML_CUDA_NO_PEER_COPY)
+    endif()
+
+    if (GGML_CUDA_CUDNN_FOUND)
+        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_USE_CUDNN)
+        target_include_directories(ggml-cuda PRIVATE
+            ${CUDNN_INCLUDE_DIR}
+        )
+        target_link_libraries(ggml-cuda PRIVATE
+            ${CUDNN_LIBRARY}
+        )
+    endif()
+
+    if (GGML_CUDA_CUDNN_SDPA_FOUND)
+        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_USE_CUDNN_SDPA)
+        target_include_directories(ggml-cuda PRIVATE
+            ${CUDNN_FRONTEND_INCLUDE_DIR}
+        )
+        target_link_libraries(ggml-cuda PRIVATE
+            ${CUDNN_LIBRARY}
+            CUDA::nvrtc
+        )
     endif()
 
     if (GGML_STATIC)

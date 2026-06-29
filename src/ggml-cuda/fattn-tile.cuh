@@ -885,7 +885,7 @@ static __global__ void flash_attn_tile(
     const int stride_V2   = nb21 / sizeof(half2);
     const int stride_mask = nb31 / sizeof(half);
 
-    const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, head0, n_head_log2, m0, m1) : 1.0f;
+    const float slope = has_mask && ncols2 == 1 ? get_alibi_slope(max_bias, head0, n_head_log2, m0, m1) : 1.0f;
 
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb / 4;
@@ -1232,12 +1232,12 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
         if (Q->ne[1] > 2/ncols2) {
             constexpr int cols_per_block = 4;
             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
-            const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
-            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, has_mask>;
-            launch_fattn<DV, cols_per_block/ncols2, ncols2>
-                (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, warp_size);
-            return;
-        }
+    const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+    fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, has_mask>;
+    launch_fattn<DV, cols_per_block/ncols2, ncols2>
+        (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa, true, true, false, warp_size);
+    return;
+}
     }
 
     if constexpr (ncols2 <= 2) {
@@ -1336,7 +1336,7 @@ void ggml_cuda_flash_attn_ext_tile_case(ggml_backend_cuda_context & ctx, ggml_te
 
     if (logit_softcap == 0.0f) {
         constexpr bool use_logit_softcap = false;
-        if constexpr (DKQ == 56 && DV == 56) {
+        if constexpr ((DKQ == 32 && DV == 32) || (DKQ == 56 && DV == 56)) {
             if (has_mask) {
                 launch_fattn_tile_switch_ncols2<DKQ, DV, use_logit_softcap, true>(ctx, dst);
             } else {
@@ -1347,7 +1347,7 @@ void ggml_cuda_flash_attn_ext_tile_case(ggml_backend_cuda_context & ctx, ggml_te
         }
     } else {
         constexpr bool use_logit_softcap = true;
-        if constexpr (DKQ == 56 && DV == 56) {
+        if constexpr ((DKQ == 32 && DV == 32) || (DKQ == 56 && DV == 56)) {
             if (has_mask) {
                 launch_fattn_tile_switch_ncols2<DKQ, DV, use_logit_softcap, true>(ctx, dst);
             } else {

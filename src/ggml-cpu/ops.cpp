@@ -9549,7 +9549,8 @@ void ggml_compute_forward_ssm_scan(
 
 // ggml_compute_forward_win_part
 
-static void ggml_compute_forward_win_part_f32(
+template <typename T>
+static void ggml_compute_forward_win_part_t(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
     GGML_UNUSED(params);
@@ -9562,28 +9563,31 @@ static void ggml_compute_forward_win_part_f32(
     const int32_t nep0 = ((const int32_t *)(dst->op_params))[0];
     const int32_t nep1 = ((const int32_t *)(dst->op_params))[1];
     const int32_t w    = ((const int32_t *)(dst->op_params))[2];
+    const int64_t np   = (int64_t) nep0*nep1;
 
     assert(ne00 == ne0);
-    assert(ne3  == nep0*nep1);
+    assert(ne3  == np*ne03);
 
     // TODO: optimize / multi-thread
-    for (int py = 0; py < nep1; ++py) {
-        for (int px = 0; px < nep0; ++px) {
-            const int64_t i3 = py*nep0 + px;
-            for (int64_t i2 = 0; i2 < ne2; ++i2) {
-                for (int64_t i1 = 0; i1 < ne1; ++i1) {
-                    for (int64_t i0 = 0; i0 < ne0; ++i0) {
-                        const int64_t i02 = py*w + i2;
-                        const int64_t i01 = px*w + i1;
-                        const int64_t i00 = i0;
+    for (int64_t ib = 0; ib < ne03; ++ib) {
+        for (int py = 0; py < nep1; ++py) {
+            for (int px = 0; px < nep0; ++px) {
+                const int64_t i3 = ib*np + py*nep0 + px;
+                for (int64_t i2 = 0; i2 < ne2; ++i2) {
+                    for (int64_t i1 = 0; i1 < ne1; ++i1) {
+                        for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                            const int64_t i02 = py*w + i2;
+                            const int64_t i01 = px*w + i1;
+                            const int64_t i00 = i0;
 
-                        const int64_t i = i3*ne2*ne1*ne0 + i2*ne1*ne0    + i1*ne0   + i0;
-                        const int64_t j =                  i02*ne01*ne00 + i01*ne00 + i00;
+                            const int64_t i = i3*ne2*ne1*ne0 + i2*ne1*ne0 + i1*ne0 + i0;
+                            const int64_t j = ib*ne02*ne01*ne00 + i02*ne01*ne00 + i01*ne00 + i00;
 
-                        if (py*w + i2 >= ne02 || px*w + i1 >= ne01) {
-                            ((float *) dst->data)[i] = 0.0f;
-                        } else {
-                            ((float *) dst->data)[i] = ((float *) src0->data)[j];
+                            if (py*w + i2 >= ne02 || px*w + i1 >= ne01) {
+                                ((T *) dst->data)[i] = T{};
+                            } else {
+                                ((T *) dst->data)[i] = ((const T *) src0->data)[j];
+                            }
                         }
                     }
                 }
@@ -9601,7 +9605,15 @@ void ggml_compute_forward_win_part(
     switch (src0->type) {
         case GGML_TYPE_F32:
             {
-                ggml_compute_forward_win_part_f32(params, dst);
+                ggml_compute_forward_win_part_t<float>(params, dst);
+            } break;
+        case GGML_TYPE_F16:
+            {
+                ggml_compute_forward_win_part_t<ggml_fp16_t>(params, dst);
+            } break;
+        case GGML_TYPE_BF16:
+            {
+                ggml_compute_forward_win_part_t<ggml_bf16_t>(params, dst);
             } break;
         default:
             {
@@ -9612,7 +9624,8 @@ void ggml_compute_forward_win_part(
 
 // ggml_compute_forward_win_unpart
 
-static void ggml_compute_forward_win_unpart_f32(
+template <typename T>
+static void ggml_compute_forward_win_unpart_t(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
     GGML_UNUSED(params);
@@ -9629,25 +9642,31 @@ static void ggml_compute_forward_win_unpart_f32(
     //const int py = (w - ne2%w)%w;
 
     const int npx = (px + ne1)/w;
-    //const int npy = (py + ne2)/w;
+    const int py = (w - ne2%w)%w;
+    const int npy = (py + ne2)/w;
+    const int64_t np = (int64_t) npx*npy;
 
     assert(ne0 == ne00);
+    assert(ne03 == np*ne3);
 
     // TODO: optimize / multi-thread
-    for (int64_t i2 = 0; i2 < ne2; ++i2) {
-        for (int64_t i1 = 0; i1 < ne1; ++i1) {
-            for (int64_t i0 = 0; i0 < ne0; ++i0) {
-                const int ip2 = i2/w;
-                const int ip1 = i1/w;
+    for (int64_t ib = 0; ib < ne3; ++ib) {
+        for (int64_t i2 = 0; i2 < ne2; ++i2) {
+            for (int64_t i1 = 0; i1 < ne1; ++i1) {
+                for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                    const int ip2 = i2/w;
+                    const int ip1 = i1/w;
 
-                const int64_t i02 = i2%w;
-                const int64_t i01 = i1%w;
-                const int64_t i00 = i0;
+                    const int64_t i02 = i2%w;
+                    const int64_t i01 = i1%w;
+                    const int64_t i00 = i0;
 
-                const int64_t i = (ip2*npx + ip1)*ne02*ne01*ne00 + i02*ne01*ne00 + i01*ne00 + i00;
-                const int64_t j =                                  i2*ne1*ne0    + i1*ne0   + i0;
+                    const int64_t i = (ib*np + ip2*npx + ip1)*ne02*ne01*ne00 +
+                                      i02*ne01*ne00 + i01*ne00 + i00;
+                    const int64_t j = ib*ne2*ne1*ne0 + i2*ne1*ne0 + i1*ne0 + i0;
 
-                ((float *) dst->data)[j] = ((float *) src0->data)[i];
+                    ((T *) dst->data)[j] = ((const T *) src0->data)[i];
+                }
             }
         }
     }
@@ -9662,7 +9681,15 @@ void ggml_compute_forward_win_unpart(
     switch (src0->type) {
         case GGML_TYPE_F32:
             {
-                ggml_compute_forward_win_unpart_f32(params, dst);
+                ggml_compute_forward_win_unpart_t<float>(params, dst);
+            } break;
+        case GGML_TYPE_F16:
+            {
+                ggml_compute_forward_win_unpart_t<ggml_fp16_t>(params, dst);
+            } break;
+        case GGML_TYPE_BF16:
+            {
+                ggml_compute_forward_win_unpart_t<ggml_bf16_t>(params, dst);
             } break;
         default:
             {

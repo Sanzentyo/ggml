@@ -43,6 +43,36 @@ static  __global__ void im2col_kernel(
     GGML_UNUSED(KH);
 }
 
+template <typename T>
+static __global__ void im2col_1x1_s1p0_kernel(
+        const float * __restrict__ src, T * __restrict__ dst,
+        int64_t IW, int64_t IH, int64_t IC, int64_t N,
+        int64_t IC_IH_IW, int64_t IH_IW) {
+    const int64_t i = threadIdx.x + blockIdx.x * blockDim.x;
+    const int64_t total = N * IH * IW * IC;
+    if (i >= total) {
+        return;
+    }
+
+    const int64_t ic = i % IC;
+    const int64_t pixel = i / IC;
+    const int64_t iw = pixel % IW;
+    const int64_t ih = (pixel / IW) % IH;
+    const int64_t n = pixel / (IW * IH);
+    dst[i] = src[n * IH_IW + ic * IC_IH_IW + ih * IW + iw];
+}
+
+template <typename T>
+static void im2col_1x1_s1p0_cuda(const float * src, T * dst,
+        int64_t IW, int64_t IH, int64_t IC, int64_t N,
+        int64_t IC_IH_IW, int64_t IH_IW, cudaStream_t stream) {
+    constexpr int threads = 256;
+    const int64_t total = N * IH * IW * IC;
+    const int64_t blocks = (total + threads - 1) / threads;
+    im2col_1x1_s1p0_kernel<<<blocks, threads, 0, stream>>>(
+        src, dst, IW, IH, IC, N, IC_IH_IW, IH_IW);
+}
+
 // im2col: [N, IC, IH, IW] => [N, OH, OW, IC*KH*KW]
 template <typename T>
 static void im2col_cuda(const float * x, T* dst,
@@ -53,6 +83,12 @@ static void im2col_cuda(const float * x, T* dst,
     const int64_t num_blocks = (IC_KH_KW + CUDA_IM2COL_BLOCK_SIZE - 1) / CUDA_IM2COL_BLOCK_SIZE;
     const int64_t N_OH = N * OH;
     const int64_t KH_KW = KW*KH;
+    if (getenv("GGML_CUDA_DISABLE_IM2COL_1X1_FAST") == nullptr &&
+        KW == 1 && KH == 1 && OW == IW && OH == IH &&
+        s0 == 1 && s1 == 1 && p0 == 0 && p1 == 0 && d0 == 1 && d1 == 1) {
+        im2col_1x1_s1p0_cuda(x, dst, IW, IH, IC, N, IC_IH_IW, IH_IW, stream);
+        return;
+    }
     dim3 block_nums(num_blocks, MIN(OW, MAX_GRIDDIM_Y), MIN(N_OH, MAX_GRIDDIM_Z));
     im2col_kernel<<<block_nums, MIN(IC_KH_KW, CUDA_IM2COL_BLOCK_SIZE) , 0, stream>>>(x, dst, IC, IW, IH, OH, OW, KW, KH,
                                                                                      IC_IH_IW, IH_IW, N_OH, KH_KW, IC_KH_KW,

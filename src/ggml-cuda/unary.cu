@@ -136,6 +136,51 @@ static __global__ void unary_cpy_op_kernel(const src_t * x, dst_t * dst, const i
     dst[i] = (dst_t)op((float)x[i]);
 }
 
+template <float (*op)(float), typename dst2_t>
+static __global__ void unary_cpy_f32_vec2_op_kernel(const float2 * x, dst2_t * dst, const int k2) {
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k2) {
+        return;
+    }
+
+    const float2 src = x[i];
+    dst[i] = ggml_cuda_cast<dst2_t>(make_float2(op(src.x), op(src.y)));
+}
+
+template <float (*op)(float), typename dst2_t>
+static __global__ void unary_cpy_f32_vec4_op_kernel(const float4 * x, dst2_t * dst, const int k4) {
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k4) {
+        return;
+    }
+
+    const float4 src = x[i];
+    dst[2*i + 0] = ggml_cuda_cast<dst2_t>(make_float2(op(src.x), op(src.y)));
+    dst[2*i + 1] = ggml_cuda_cast<dst2_t>(make_float2(op(src.z), op(src.w)));
+}
+
+struct unary_bf16x4 {
+    nv_bfloat162 lo;
+    nv_bfloat162 hi;
+};
+
+template <float (*op)(float)>
+static __global__ void unary_cpy_f32_vec4_packed_bf16_op_kernel(const float4 * x, unary_bf16x4 * dst, const int k4) {
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k4) {
+        return;
+    }
+
+    const float4 src = x[i];
+    dst[i] = {
+        ggml_cuda_cast<nv_bfloat162>(make_float2(op(src.x), op(src.y))),
+        ggml_cuda_cast<nv_bfloat162>(make_float2(op(src.z), op(src.w))),
+    };
+}
+
 template <float (*op)(float), typename T>
 static void unary_cuda(const T * x, T * dst, const int k, cudaStream_t stream) {
     const int num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
@@ -146,6 +191,59 @@ template <float (*op)(float), typename src_t, typename dst_t>
 static void unary_cpy_cuda(const src_t * x, dst_t * dst, const int k, cudaStream_t stream) {
     const int num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
     unary_cpy_op_kernel<op><<<num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream>>>(x, dst, k);
+}
+
+template <float (*op)(float), typename dst2_t>
+static void unary_cpy_f32_vec2_cuda(const float * x, dst2_t * dst, const int k, cudaStream_t stream) {
+    GGML_ASSERT(k % 2 == 0);
+    const int k2 = k / 2;
+    const int num_blocks = (k2 + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+    unary_cpy_f32_vec2_op_kernel<op><<<num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream>>>(
+        reinterpret_cast<const float2 *>(x), dst, k2);
+}
+
+template <float (*op)(float), typename dst2_t>
+static void unary_cpy_f32_vec4_cuda(const float * x, dst2_t * dst, const int k, cudaStream_t stream) {
+    GGML_ASSERT(k % 4 == 0);
+    const int k4 = k / 4;
+    const int num_blocks = (k4 + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+    unary_cpy_f32_vec4_op_kernel<op><<<num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream>>>(
+        reinterpret_cast<const float4 *>(x), dst, k4);
+}
+
+template <float (*op)(float)>
+static void unary_cpy_f32_vec4_packed_bf16_cuda(const float * x, nv_bfloat162 * dst, const int k, cudaStream_t stream) {
+    GGML_ASSERT(k % 4 == 0);
+    const int k4 = k / 4;
+    const int num_blocks = (k4 + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+    unary_cpy_f32_vec4_packed_bf16_op_kernel<op><<<num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream>>>(
+        reinterpret_cast<const float4 *>(x), reinterpret_cast<unary_bf16x4 *>(dst), k4);
+}
+
+static bool unary_cpy_f32_vec4_packed_bf16_enabled(const ggml_tensor * src, const ggml_tensor * dst) {
+    return getenv("GGML_CUDA_ENABLE_UNARY_CPY_VEC4_PACKED") != nullptr &&
+           std::atoi(getenv("GGML_CUDA_ENABLE_UNARY_CPY_VEC4_PACKED")) != 0 &&
+           src->type == GGML_TYPE_F32 &&
+           dst->type == GGML_TYPE_BF16 &&
+           ggml_nelements(src) % 4 == 0 &&
+           reinterpret_cast<uintptr_t>(src->data) % alignof(float4) == 0 &&
+           reinterpret_cast<uintptr_t>(dst->data) % alignof(unary_bf16x4) == 0;
+}
+
+static bool unary_cpy_f32_vec4_enabled(const ggml_tensor * src, const ggml_tensor * dst) {
+    return getenv("GGML_CUDA_DISABLE_UNARY_CPY_VEC4") == nullptr &&
+           src->type == GGML_TYPE_F32 &&
+           ggml_nelements(src) % 4 == 0 &&
+           reinterpret_cast<uintptr_t>(src->data) % alignof(float4) == 0 &&
+           reinterpret_cast<uintptr_t>(dst->data) % 8 == 0;
+}
+
+static bool unary_cpy_f32_vec2_enabled(const ggml_tensor * src, const ggml_tensor * dst) {
+    return getenv("GGML_CUDA_DISABLE_UNARY_CPY_VEC2") == nullptr &&
+           src->type == GGML_TYPE_F32 &&
+           ggml_nelements(src) % 2 == 0 &&
+           reinterpret_cast<uintptr_t>(src->data) % alignof(float2) == 0 &&
+           reinterpret_cast<uintptr_t>(dst->data) % 4 == 0;
 }
 
 template <float (*op)(float)>
@@ -186,9 +284,23 @@ static void ggml_cuda_op_unary_cpy_impl(ggml_backend_cuda_context & ctx, ggml_te
     GGML_ASSERT(ggml_nelements(src0) == ggml_nelements(dst));
 
     if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_BF16) {
-        unary_cpy_cuda<op>((const float *)src0_d, (nv_bfloat16 *)dst_d, ggml_nelements(src0), stream);
+        if (unary_cpy_f32_vec4_packed_bf16_enabled(src0, dst)) {
+            unary_cpy_f32_vec4_packed_bf16_cuda<op>((const float *)src0_d, (nv_bfloat162 *)dst_d, ggml_nelements(src0), stream);
+        } else if (unary_cpy_f32_vec4_enabled(src0, dst)) {
+            unary_cpy_f32_vec4_cuda<op>((const float *)src0_d, (nv_bfloat162 *)dst_d, ggml_nelements(src0), stream);
+        } else if (unary_cpy_f32_vec2_enabled(src0, dst)) {
+            unary_cpy_f32_vec2_cuda<op>((const float *)src0_d, (nv_bfloat162 *)dst_d, ggml_nelements(src0), stream);
+        } else {
+            unary_cpy_cuda<op>((const float *)src0_d, (nv_bfloat16 *)dst_d, ggml_nelements(src0), stream);
+        }
     } else if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16) {
-        unary_cpy_cuda<op>((const float *)src0_d, (half *)dst_d, ggml_nelements(src0), stream);
+        if (unary_cpy_f32_vec4_enabled(src0, dst)) {
+            unary_cpy_f32_vec4_cuda<op>((const float *)src0_d, (half2 *)dst_d, ggml_nelements(src0), stream);
+        } else if (unary_cpy_f32_vec2_enabled(src0, dst)) {
+            unary_cpy_f32_vec2_cuda<op>((const float *)src0_d, (half2 *)dst_d, ggml_nelements(src0), stream);
+        } else {
+            unary_cpy_cuda<op>((const float *)src0_d, (half *)dst_d, ggml_nelements(src0), stream);
+        }
     } else {
         GGML_ABORT("unsupported fused unary cpy: %s -> %s", ggml_type_name(src0->type), ggml_type_name(dst->type));
     }

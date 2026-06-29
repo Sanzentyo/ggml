@@ -1,4 +1,5 @@
 #include "norm.cuh"
+#include "convert.cuh"
 #include <cstdlib>
 #include <cstdint>
 
@@ -18,7 +19,19 @@ static int ggml_cuda_norm_1024_mode() {
     return mode;
 }
 
-template <int block_size, bool do_multiply = false, bool do_add = false>
+static bool ggml_cuda_enable_norm_1024_affine_axis0() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_CUDA_ENABLE_NORM_1024_AFFINE_AXIS0");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+template <int block_size,
+          bool do_multiply = false,
+          bool do_add = false,
+          bool write_side = false,
+          typename side_t = float>
 static __global__ void norm_f32(
         const float * x, float * dst, const int ncols, const int64_t stride_row, const int64_t stride_channel,
         const int64_t stride_sample, const float eps,
@@ -37,7 +50,11 @@ static __global__ void norm_f32(
         const uint3   add_ncols_packed     = make_uint3(0, 0, 0),
         const uint3   add_nrows_packed     = make_uint3(0, 0, 0),
         const uint3   add_nchannels_packed = make_uint3(0, 0, 0),
-        const uint3   add_nsamples_packed  = make_uint3(0, 0, 0)) {
+        const uint3   add_nsamples_packed  = make_uint3(0, 0, 0),
+        side_t *      side_dst             = nullptr,
+        const int64_t side_stride_row      = 0,
+        const int64_t side_stride_channel  = 0,
+        const int64_t side_stride_sample   = 0) {
     const int nrows     = gridDim.x;
     const int nchannels = gridDim.y;
 
@@ -50,6 +67,9 @@ static __global__ void norm_f32(
 
     x   += sample*stride_sample + channel*stride_channel + row*stride_row;
     dst += ((sample*nchannels + channel)*nrows + row)*ncols;
+    if constexpr (write_side) {
+        side_dst += sample*side_stride_sample + channel*side_stride_channel + row*side_stride_row;
+    }
 
     if constexpr (do_multiply) {
         const uint32_t mul_row     = fastmodulo(row, mul_nrows_packed);
@@ -86,19 +106,36 @@ static __global__ void norm_f32(
         if constexpr (do_multiply && do_add) {
             const uint32_t mul_col = fastmodulo(col, mul_ncols_packed);
             const uint32_t add_col = fastmodulo(col, add_ncols_packed);
-            dst[col] = __fadd_rn(__fmul_rn(norm, mul[mul_col]), add[add_col]);
+            const float result = __fadd_rn(__fmul_rn(norm, mul[mul_col]), add[add_col]);
+            dst[col] = result;
+            if constexpr (write_side) {
+                side_dst[col] = ggml_cuda_cast<side_t>(result);
+            }
         } else if constexpr (do_multiply) {
             const uint32_t mul_col = fastmodulo(col, mul_ncols_packed);
-            dst[col] = __fmul_rn(norm, mul[mul_col]);
+            const float result = __fmul_rn(norm, mul[mul_col]);
+            dst[col] = result;
+            if constexpr (write_side) {
+                side_dst[col] = ggml_cuda_cast<side_t>(result);
+            }
         } else {
             dst[col] = norm;
+            if constexpr (write_side) {
+                side_dst[col] = ggml_cuda_cast<side_t>(norm);
+            }
         }
     }
 }
 
-template <int block_size, bool do_multiply = false, bool do_add = false, bool preserve_residual = false>
+template <int block_size,
+          bool do_multiply = false,
+          bool do_add = false,
+          bool preserve_residual = false,
+          bool write_side = false,
+          typename side_t = float,
+          typename x1_t = float>
 static __global__ void norm_residual_f32(
-        const float * x0, const float * x1, float * dst, const int ncols,
+        const float * x0, const x1_t * x1, float * dst, const int ncols,
         const int64_t stride0_row, const int64_t stride0_channel, const int64_t stride0_sample,
         const int64_t stride1_row, const int64_t stride1_channel, const int64_t stride1_sample,
         const int64_t stride_dst_row, const int64_t stride_dst_channel, const int64_t stride_dst_sample,
@@ -120,7 +157,11 @@ static __global__ void norm_residual_f32(
         const uint3   add_ncols_packed     = make_uint3(0, 0, 0),
         const uint3   add_nrows_packed     = make_uint3(0, 0, 0),
         const uint3   add_nchannels_packed = make_uint3(0, 0, 0),
-        const uint3   add_nsamples_packed  = make_uint3(0, 0, 0)) {
+        const uint3   add_nsamples_packed  = make_uint3(0, 0, 0),
+        side_t *      side_dst             = nullptr,
+        const int64_t stride_side_row      = 0,
+        const int64_t stride_side_channel  = 0,
+        const int64_t stride_side_sample   = 0) {
     const int row     = blockIdx.x;
     const int channel = blockIdx.y;
     const int sample  = blockIdx.z;
@@ -133,6 +174,9 @@ static __global__ void norm_residual_f32(
     dst += sample*stride_dst_sample + channel*stride_dst_channel + row*stride_dst_row;
     if constexpr (preserve_residual) {
         residual_dst += sample*stride_residual_sample + channel*stride_residual_channel + row*stride_residual_row;
+    }
+    if constexpr (write_side) {
+        side_dst += sample*stride_side_sample + channel*stride_side_channel + row*stride_side_row;
     }
 
     if constexpr (do_multiply) {
@@ -152,7 +196,7 @@ static __global__ void norm_residual_f32(
     float2 mean_var = make_float2(0.0f, 0.0f);
 
     for (int col = tid; col < ncols; col += block_size) {
-        const float xi = __fadd_rn(x0[col], x1[col]);
+        const float xi = __fadd_rn(x0[col], ggml_cuda_cast<float>(x1[col]));
         mean_var.x += xi;
         mean_var.y += xi * xi;
     }
@@ -165,7 +209,7 @@ static __global__ void norm_residual_f32(
     const float inv_std = rsqrtf(var + eps);
 
     for (int col = tid; col < ncols; col += block_size) {
-        const float xi = __fadd_rn(x0[col], x1[col]);
+        const float xi = __fadd_rn(x0[col], ggml_cuda_cast<float>(x1[col]));
         if constexpr (preserve_residual) {
             residual_dst[col] = xi;
         }
@@ -173,12 +217,87 @@ static __global__ void norm_residual_f32(
         if constexpr (do_multiply && do_add) {
             const uint32_t mul_col = fastmodulo(col, mul_ncols_packed);
             const uint32_t add_col = fastmodulo(col, add_ncols_packed);
-            dst[col] = __fadd_rn(__fmul_rn(norm, mul[mul_col]), add[add_col]);
+            const float result = __fadd_rn(__fmul_rn(norm, mul[mul_col]), add[add_col]);
+            dst[col] = result;
+            if constexpr (write_side) {
+                side_dst[col] = (side_t) result;
+            }
         } else if constexpr (do_multiply) {
             const uint32_t mul_col = fastmodulo(col, mul_ncols_packed);
-            dst[col] = __fmul_rn(norm, mul[mul_col]);
+            const float result = __fmul_rn(norm, mul[mul_col]);
+            dst[col] = result;
+            if constexpr (write_side) {
+                side_dst[col] = (side_t) result;
+            }
         } else {
             dst[col] = norm;
+            if constexpr (write_side) {
+                side_dst[col] = (side_t) norm;
+            }
+        }
+    }
+}
+
+template <int block_size,
+          bool preserve_residual = false,
+          bool write_side = false,
+          typename side_t = float,
+          typename x1_t = float>
+static __global__ void norm_residual_f32_1024_affine_axis0(
+        const float * x0, const x1_t * x1, float * dst,
+        const int64_t stride0_row, const int64_t stride0_channel, const int64_t stride0_sample,
+        const int64_t stride1_row, const int64_t stride1_channel, const int64_t stride1_sample,
+        const int64_t stride_dst_row, const int64_t stride_dst_channel, const int64_t stride_dst_sample,
+        float * residual_dst,
+        const int64_t stride_residual_row, const int64_t stride_residual_channel, const int64_t stride_residual_sample,
+        const float eps,
+        const float * mul,
+        const float * add,
+        side_t * side_dst = nullptr,
+        const int64_t stride_side_row = 0,
+        const int64_t stride_side_channel = 0,
+        const int64_t stride_side_sample = 0) {
+    constexpr int ncols = 1024;
+    const int row     = blockIdx.x;
+    const int channel = blockIdx.y;
+    const int sample  = blockIdx.z;
+    const int tid     = threadIdx.x;
+
+    x0  += sample*stride0_sample + channel*stride0_channel + row*stride0_row;
+    x1  += sample*stride1_sample + channel*stride1_channel + row*stride1_row;
+    dst += sample*stride_dst_sample + channel*stride_dst_channel + row*stride_dst_row;
+    if constexpr (preserve_residual) {
+        residual_dst += sample*stride_residual_sample + channel*stride_residual_channel + row*stride_residual_row;
+    }
+    if constexpr (write_side) {
+        side_dst += sample*stride_side_sample + channel*stride_side_channel + row*stride_side_row;
+    }
+
+    float2 mean_var = make_float2(0.0f, 0.0f);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = __fadd_rn(x0[col], ggml_cuda_cast<float>(x1[col]));
+        mean_var.x += xi;
+        mean_var.y += xi * xi;
+    }
+
+    extern __shared__ float2 s_sum2[];
+    mean_var = block_reduce<block_reduce_method::SUM, block_size>(mean_var, s_sum2);
+
+    const float mean = mean_var.x / ncols;
+    const float var = mean_var.y / ncols - mean * mean;
+    const float inv_std = rsqrtf(var + eps);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = __fadd_rn(x0[col], ggml_cuda_cast<float>(x1[col]));
+        if constexpr (preserve_residual) {
+            residual_dst[col] = xi;
+        }
+        const float norm = (xi - mean) * inv_std;
+        const float result = __fadd_rn(__fmul_rn(norm, mul[col]), add[col]);
+        dst[col] = result;
+        if constexpr (write_side) {
+            side_dst[col] = (side_t) result;
         }
     }
 }
@@ -455,10 +574,15 @@ static void norm_mul_f32_cuda(const float *  x,
                               const int64_t  add_stride_sample,
                               const uint32_t add_ncols,
                               const uint32_t add_nrows,
-                              const uint32_t add_nchannels,
-                              const uint32_t add_nsamples,
-                              const float    eps,
-                              cudaStream_t   stream) {
+	                              const uint32_t add_nchannels,
+	                              const uint32_t add_nsamples,
+	                              const float    eps,
+	                              cudaStream_t   stream,
+	                              const ggml_type side_type = GGML_TYPE_COUNT,
+	                              void *          side_dst = nullptr,
+	                              const int64_t   side_stride_row = 0,
+	                              const int64_t   side_stride_channel = 0,
+	                              const int64_t   side_stride_sample = 0) {
     const dim3 blocks_num(nrows, nchannels, nsamples);
     if (mul == nullptr) {
         norm_f32_cuda(x, dst, ncols, nrows, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, stream);
@@ -487,38 +611,120 @@ static void norm_mul_f32_cuda(const float *  x,
                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed);
         }
-    } else {
-        const uint3 add_ncols_packed     = init_fastdiv_values(add_ncols);
-        const uint3 add_nrows_packed     = init_fastdiv_values(add_nrows);
-        const uint3 add_nchannels_packed = init_fastdiv_values(add_nchannels);
-        const uint3 add_nsamples_packed  = init_fastdiv_values(add_nsamples);
-        if (ncols < 1024 || (ncols == 1024 && ggml_cuda_norm_1024_mode() == 1)) {
-            const dim3 block_dims(WARP_SIZE, 1, 1);
-            norm_f32<WARP_SIZE, true, true><<<blocks_num, block_dims, 0, stream>>>(
-                x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
-                mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add,
-                add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,
-                add_nchannels_packed, add_nsamples_packed);
-        } else if (ncols == 1024 && ggml_cuda_norm_1024_mode() == 2) {
-            const dim3 block_dims(256, 1, 1);
-            norm_f32<256, true, true><<<blocks_num, block_dims, 32 * sizeof(float2), stream>>>(
-                x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
-                mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add,
-                add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,
-                add_nchannels_packed, add_nsamples_packed);
-        } else {
-            const dim3 block_dims(1024, 1, 1);
-            norm_f32<1024, true, true><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float2): 0, stream>>>(
-                x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
-                mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add,
-                add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,
-                add_nchannels_packed, add_nsamples_packed);
-        }
-    }
+	} else {
+	    const uint3 add_ncols_packed     = init_fastdiv_values(add_ncols);
+	    const uint3 add_nrows_packed     = init_fastdiv_values(add_nrows);
+	    const uint3 add_nchannels_packed = init_fastdiv_values(add_nchannels);
+	    const uint3 add_nsamples_packed  = init_fastdiv_values(add_nsamples);
+
+#define GGML_CUDA_LAUNCH_NORM_MUL_ADD(BLOCK_SIZE, SHMEM_BYTES)                                 \
+    do {                                                                                        \
+        if (side_dst != nullptr && side_type == GGML_TYPE_BF16) {                                \
+            norm_f32<BLOCK_SIZE, true, true, true, nv_bfloat16>                                  \
+                <<<blocks_num, block_dims, SHMEM_BYTES, stream>>>(                               \
+                    x,                                                                           \
+                    dst,                                                                         \
+                    ncols,                                                                       \
+                    stride_row,                                                                  \
+                    stride_channel,                                                              \
+                    stride_sample,                                                               \
+                    eps,                                                                         \
+                    mul,                                                                         \
+                    mul_stride_row,                                                              \
+                    mul_stride_channel,                                                          \
+                    mul_stride_sample,                                                           \
+                    mul_ncols_packed,                                                            \
+                    mul_nrows_packed,                                                            \
+                    mul_nchannels_packed,                                                        \
+                    mul_nsamples_packed,                                                         \
+                    add,                                                                         \
+                    add_stride_row,                                                              \
+                    add_stride_channel,                                                          \
+                    add_stride_sample,                                                           \
+                    add_ncols_packed,                                                            \
+                    add_nrows_packed,                                                            \
+                    add_nchannels_packed,                                                        \
+                    add_nsamples_packed,                                                         \
+                    (nv_bfloat16 *) side_dst,                                                    \
+                    side_stride_row,                                                             \
+                    side_stride_channel,                                                         \
+                    side_stride_sample);                                                         \
+        } else if (side_dst != nullptr && side_type == GGML_TYPE_F16) {                           \
+            norm_f32<BLOCK_SIZE, true, true, true, half>                                         \
+                <<<blocks_num, block_dims, SHMEM_BYTES, stream>>>(                               \
+                    x,                                                                           \
+                    dst,                                                                         \
+                    ncols,                                                                       \
+                    stride_row,                                                                  \
+                    stride_channel,                                                              \
+                    stride_sample,                                                               \
+                    eps,                                                                         \
+                    mul,                                                                         \
+                    mul_stride_row,                                                              \
+                    mul_stride_channel,                                                          \
+                    mul_stride_sample,                                                           \
+                    mul_ncols_packed,                                                            \
+                    mul_nrows_packed,                                                            \
+                    mul_nchannels_packed,                                                        \
+                    mul_nsamples_packed,                                                         \
+                    add,                                                                         \
+                    add_stride_row,                                                              \
+                    add_stride_channel,                                                          \
+                    add_stride_sample,                                                           \
+                    add_ncols_packed,                                                            \
+                    add_nrows_packed,                                                            \
+                    add_nchannels_packed,                                                        \
+                    add_nsamples_packed,                                                         \
+                    (half *) side_dst,                                                           \
+                    side_stride_row,                                                             \
+                    side_stride_channel,                                                         \
+                    side_stride_sample);                                                         \
+        } else {                                                                                 \
+            norm_f32<BLOCK_SIZE, true, true><<<blocks_num, block_dims, SHMEM_BYTES, stream>>>(    \
+                x,                                                                                \
+                dst,                                                                              \
+                ncols,                                                                            \
+                stride_row,                                                                       \
+                stride_channel,                                                                   \
+                stride_sample,                                                                    \
+                eps,                                                                              \
+                mul,                                                                              \
+                mul_stride_row,                                                                   \
+                mul_stride_channel,                                                               \
+                mul_stride_sample,                                                                \
+                mul_ncols_packed,                                                                 \
+                mul_nrows_packed,                                                                 \
+                mul_nchannels_packed,                                                             \
+                mul_nsamples_packed,                                                              \
+                add,                                                                              \
+                add_stride_row,                                                                   \
+                add_stride_channel,                                                               \
+                add_stride_sample,                                                                \
+                add_ncols_packed,                                                                 \
+                add_nrows_packed,                                                                 \
+                add_nchannels_packed,                                                             \
+                add_nsamples_packed);                                                             \
+        }                                                                                         \
+    } while (0)
+
+	    if (ncols < 1024 || (ncols == 1024 && ggml_cuda_norm_1024_mode() == 1)) {
+	        const dim3 block_dims(WARP_SIZE, 1, 1);
+	        GGML_CUDA_LAUNCH_NORM_MUL_ADD(WARP_SIZE, 0);
+	    } else if (ncols == 1024 && ggml_cuda_norm_1024_mode() == 2) {
+	        const dim3 block_dims(256, 1, 1);
+	        GGML_CUDA_LAUNCH_NORM_MUL_ADD(256, 32 * sizeof(float2));
+	    } else {
+	        const dim3 block_dims(1024, 1, 1);
+	        GGML_CUDA_LAUNCH_NORM_MUL_ADD(
+	            1024, block_dims.x > WARP_SIZE ? 32 * sizeof(float2) : 0);
+	    }
+
+#undef GGML_CUDA_LAUNCH_NORM_MUL_ADD
+	}
 }
 
 static void norm_residual_mul_f32_cuda(const float *  x0,
-                                       const float *  x1,
+                                       const void *   x1,
                                        const float *  mul,
                                        const float *  add,
                                        float *        dst,
@@ -554,7 +760,13 @@ static void norm_residual_mul_f32_cuda(const float *  x0,
                                        const uint32_t add_nchannels,
                                        const uint32_t add_nsamples,
                                        const float    eps,
-                                       cudaStream_t   stream) {
+                                       cudaStream_t   stream,
+                                       const ggml_type x1_type = GGML_TYPE_F32,
+                                       const ggml_type side_type = GGML_TYPE_COUNT,
+                                       void *          side_dst = nullptr,
+                                       const int64_t   stride_side_row = 0,
+                                       const int64_t   stride_side_channel = 0,
+                                       const int64_t   stride_side_sample = 0) {
     const dim3 blocks_num(nrows, nchannels, nsamples);
 
     const uint3 mul_ncols_packed     = init_fastdiv_values(mul_ncols);
@@ -567,61 +779,288 @@ static void norm_residual_mul_f32_cuda(const float *  x0,
     const uint3 add_nchannels_packed = init_fastdiv_values(add_nchannels);
     const uint3 add_nsamples_packed  = init_fastdiv_values(add_nsamples);
 
+#define GGML_CUDA_LAUNCH_NORM_RESIDUAL_1024_AFFINE_AXIS0_TYPED(                                      \
+    BLOCK_SIZE, PRESERVE_RESIDUAL, SHMEM_BYTES, X1_T)                                                \
+    do {                                                                                             \
+        const X1_T * x1_typed = static_cast<const X1_T *>(x1);                                       \
+        if (side_dst != nullptr && side_type == GGML_TYPE_BF16) {                                     \
+            norm_residual_f32_1024_affine_axis0<                                                     \
+                BLOCK_SIZE, PRESERVE_RESIDUAL, true, nv_bfloat16, X1_T>                              \
+                <<<blocks_num, block_dims, SHMEM_BYTES, stream>>>(                                   \
+                    x0,                                                                               \
+                    x1_typed,                                                                         \
+                    dst,                                                                              \
+                    stride0_row,                                                                      \
+                    stride0_channel,                                                                  \
+                    stride0_sample,                                                                   \
+                    stride1_row,                                                                      \
+                    stride1_channel,                                                                  \
+                    stride1_sample,                                                                   \
+                    stride_dst_row,                                                                   \
+                    stride_dst_channel,                                                               \
+                    stride_dst_sample,                                                                \
+                    residual_dst,                                                                     \
+                    stride_residual_row,                                                              \
+                    stride_residual_channel,                                                          \
+                    stride_residual_sample,                                                           \
+                    eps,                                                                              \
+                    mul,                                                                              \
+                    add,                                                                              \
+                    (nv_bfloat16 *) side_dst,                                                         \
+                    stride_side_row,                                                                  \
+                    stride_side_channel,                                                              \
+                    stride_side_sample);                                                              \
+        } else if (side_dst != nullptr && side_type == GGML_TYPE_F16) {                               \
+            norm_residual_f32_1024_affine_axis0<                                                     \
+                BLOCK_SIZE, PRESERVE_RESIDUAL, true, half, X1_T>                                     \
+                <<<blocks_num, block_dims, SHMEM_BYTES, stream>>>(                                    \
+                    x0,                                                                               \
+                    x1_typed,                                                                         \
+                    dst,                                                                              \
+                    stride0_row,                                                                      \
+                    stride0_channel,                                                                  \
+                    stride0_sample,                                                                   \
+                    stride1_row,                                                                      \
+                    stride1_channel,                                                                  \
+                    stride1_sample,                                                                   \
+                    stride_dst_row,                                                                   \
+                    stride_dst_channel,                                                               \
+                    stride_dst_sample,                                                                \
+                    residual_dst,                                                                     \
+                    stride_residual_row,                                                              \
+                    stride_residual_channel,                                                          \
+                    stride_residual_sample,                                                           \
+                    eps,                                                                              \
+                    mul,                                                                              \
+                    add,                                                                              \
+                    (half *) side_dst,                                                                \
+                    stride_side_row,                                                                  \
+                    stride_side_channel,                                                              \
+                    stride_side_sample);                                                              \
+        } else {                                                                                     \
+            norm_residual_f32_1024_affine_axis0<                                                     \
+                BLOCK_SIZE, PRESERVE_RESIDUAL, false, float, X1_T>                                   \
+                <<<blocks_num, block_dims, SHMEM_BYTES, stream>>>(                                    \
+                    x0,                                                                               \
+                    x1_typed,                                                                         \
+                    dst,                                                                              \
+                    stride0_row,                                                                      \
+                    stride0_channel,                                                                  \
+                    stride0_sample,                                                                   \
+                    stride1_row,                                                                      \
+                    stride1_channel,                                                                  \
+                    stride1_sample,                                                                   \
+                    stride_dst_row,                                                                   \
+                    stride_dst_channel,                                                               \
+                    stride_dst_sample,                                                                \
+                    residual_dst,                                                                     \
+                    stride_residual_row,                                                              \
+                    stride_residual_channel,                                                          \
+                    stride_residual_sample,                                                           \
+                    eps,                                                                              \
+                    mul,                                                                              \
+                    add);                                                                             \
+        }                                                                                            \
+    } while (0)
+
+#define GGML_CUDA_LAUNCH_NORM_RESIDUAL_1024_AFFINE_AXIS0(BLOCK_SIZE, PRESERVE_RESIDUAL, SHMEM_BYTES) \
+    do {                                                                                             \
+        if (x1_type == GGML_TYPE_BF16) {                                                             \
+            GGML_CUDA_LAUNCH_NORM_RESIDUAL_1024_AFFINE_AXIS0_TYPED(                                  \
+                BLOCK_SIZE, PRESERVE_RESIDUAL, SHMEM_BYTES, nv_bfloat16);                            \
+        } else if (x1_type == GGML_TYPE_F16) {                                                       \
+            GGML_CUDA_LAUNCH_NORM_RESIDUAL_1024_AFFINE_AXIS0_TYPED(                                  \
+                BLOCK_SIZE, PRESERVE_RESIDUAL, SHMEM_BYTES, half);                                   \
+        } else {                                                                                     \
+            GGML_ASSERT(x1_type == GGML_TYPE_F32);                                                   \
+            GGML_CUDA_LAUNCH_NORM_RESIDUAL_1024_AFFINE_AXIS0_TYPED(                                  \
+                BLOCK_SIZE, PRESERVE_RESIDUAL, SHMEM_BYTES, float);                                  \
+        }                                                                                            \
+    } while (0)
+
+#define GGML_CUDA_LAUNCH_NORM_RESIDUAL_TYPED(BLOCK_SIZE, PRESERVE_RESIDUAL, SHMEM_BYTES, X1_T)      \
+    do {                                                                                            \
+        const X1_T * x1_typed = static_cast<const X1_T *>(x1);                                      \
+        if (side_dst != nullptr && side_type == GGML_TYPE_BF16) {                                    \
+            norm_residual_f32<BLOCK_SIZE, true, true, PRESERVE_RESIDUAL, true, nv_bfloat16, X1_T>   \
+                <<<blocks_num, block_dims, SHMEM_BYTES, stream>>>(                                  \
+                    x0,                                                                             \
+                    x1_typed,                                                                       \
+                    dst,                                                                            \
+                    ncols,                                                                          \
+                    stride0_row,                                                                    \
+                    stride0_channel,                                                                \
+                    stride0_sample,                                                                 \
+                    stride1_row,                                                                    \
+                    stride1_channel,                                                                \
+                    stride1_sample,                                                                 \
+                    stride_dst_row,                                                                 \
+                    stride_dst_channel,                                                             \
+                    stride_dst_sample,                                                              \
+                    residual_dst,                                                                   \
+                    stride_residual_row,                                                            \
+                    stride_residual_channel,                                                        \
+                    stride_residual_sample,                                                         \
+                    eps,                                                                            \
+                    mul,                                                                            \
+                    mul_stride_row,                                                                 \
+                    mul_stride_channel,                                                             \
+                    mul_stride_sample,                                                              \
+                    mul_ncols_packed,                                                               \
+                    mul_nrows_packed,                                                               \
+                    mul_nchannels_packed,                                                           \
+                    mul_nsamples_packed,                                                            \
+                    add,                                                                            \
+                    add_stride_row,                                                                 \
+                    add_stride_channel,                                                             \
+                    add_stride_sample,                                                              \
+                    add_ncols_packed,                                                               \
+                    add_nrows_packed,                                                               \
+                    add_nchannels_packed,                                                           \
+                    add_nsamples_packed,                                                            \
+                    (nv_bfloat16 *) side_dst,                                                       \
+                    stride_side_row,                                                                \
+                    stride_side_channel,                                                            \
+                    stride_side_sample);                                                            \
+        } else if (side_dst != nullptr && side_type == GGML_TYPE_F16) {                              \
+            norm_residual_f32<BLOCK_SIZE, true, true, PRESERVE_RESIDUAL, true, half, X1_T>          \
+                <<<blocks_num, block_dims, SHMEM_BYTES, stream>>>(                                  \
+                    x0,                                                                             \
+                    x1_typed,                                                                       \
+                    dst,                                                                            \
+                    ncols,                                                                          \
+                    stride0_row,                                                                    \
+                    stride0_channel,                                                                \
+                    stride0_sample,                                                                 \
+                    stride1_row,                                                                    \
+                    stride1_channel,                                                                \
+                    stride1_sample,                                                                 \
+                    stride_dst_row,                                                                 \
+                    stride_dst_channel,                                                             \
+                    stride_dst_sample,                                                              \
+                    residual_dst,                                                                   \
+                    stride_residual_row,                                                            \
+                    stride_residual_channel,                                                        \
+                    stride_residual_sample,                                                         \
+                    eps,                                                                            \
+                    mul,                                                                            \
+                    mul_stride_row,                                                                 \
+                    mul_stride_channel,                                                             \
+                    mul_stride_sample,                                                              \
+                    mul_ncols_packed,                                                               \
+                    mul_nrows_packed,                                                               \
+                    mul_nchannels_packed,                                                           \
+                    mul_nsamples_packed,                                                            \
+                    add,                                                                            \
+                    add_stride_row,                                                                 \
+                    add_stride_channel,                                                             \
+                    add_stride_sample,                                                              \
+                    add_ncols_packed,                                                               \
+                    add_nrows_packed,                                                               \
+                    add_nchannels_packed,                                                           \
+                    add_nsamples_packed,                                                            \
+                    (half *) side_dst,                                                              \
+                    stride_side_row,                                                                \
+                    stride_side_channel,                                                            \
+                    stride_side_sample);                                                            \
+        } else {                                                                                    \
+            norm_residual_f32<BLOCK_SIZE, true, true, PRESERVE_RESIDUAL, false, float, X1_T>        \
+                <<<blocks_num, block_dims, SHMEM_BYTES, stream>>>(                                  \
+                    x0,                                                                             \
+                    x1_typed,                                                                       \
+                    dst,                                                                            \
+                    ncols,                                                                          \
+                    stride0_row,                                                                    \
+                    stride0_channel,                                                                \
+                    stride0_sample,                                                                 \
+                    stride1_row,                                                                    \
+                    stride1_channel,                                                                \
+                    stride1_sample,                                                                 \
+                    stride_dst_row,                                                                 \
+                    stride_dst_channel,                                                             \
+                    stride_dst_sample,                                                              \
+                    residual_dst,                                                                   \
+                    stride_residual_row,                                                            \
+                    stride_residual_channel,                                                        \
+                    stride_residual_sample,                                                         \
+                    eps,                                                                            \
+                    mul,                                                                            \
+                    mul_stride_row,                                                                 \
+                    mul_stride_channel,                                                             \
+                    mul_stride_sample,                                                              \
+                    mul_ncols_packed,                                                               \
+                    mul_nrows_packed,                                                               \
+                    mul_nchannels_packed,                                                           \
+                    mul_nsamples_packed,                                                            \
+                    add,                                                                            \
+                    add_stride_row,                                                                 \
+                    add_stride_channel,                                                             \
+                    add_stride_sample,                                                              \
+                    add_ncols_packed,                                                               \
+                    add_nrows_packed,                                                               \
+                    add_nchannels_packed,                                                           \
+                    add_nsamples_packed);                                                           \
+        }                                                                                           \
+    } while (0)
+
+#define GGML_CUDA_LAUNCH_NORM_RESIDUAL(BLOCK_SIZE, PRESERVE_RESIDUAL, SHMEM_BYTES)                 \
+    do {                                                                                            \
+        if (x1_type == GGML_TYPE_BF16) {                                                            \
+            GGML_CUDA_LAUNCH_NORM_RESIDUAL_TYPED(                                                   \
+                BLOCK_SIZE, PRESERVE_RESIDUAL, SHMEM_BYTES, nv_bfloat16);                           \
+        } else if (x1_type == GGML_TYPE_F16) {                                                      \
+            GGML_CUDA_LAUNCH_NORM_RESIDUAL_TYPED(BLOCK_SIZE, PRESERVE_RESIDUAL, SHMEM_BYTES, half); \
+        } else {                                                                                    \
+            GGML_ASSERT(x1_type == GGML_TYPE_F32);                                                  \
+            GGML_CUDA_LAUNCH_NORM_RESIDUAL_TYPED(BLOCK_SIZE, PRESERVE_RESIDUAL, SHMEM_BYTES, float);\
+        }                                                                                           \
+    } while (0)
+
+    const bool affine_axis0_1024 =
+        ggml_cuda_enable_norm_1024_affine_axis0() &&
+        ncols == 1024 &&
+        mul_ncols == 1024 && mul_nrows == 1 && mul_nchannels == 1 && mul_nsamples == 1 &&
+        add_ncols == 1024 && add_nrows == 1 && add_nchannels == 1 && add_nsamples == 1;
+
     if (ncols < 1024 || (ncols == 1024 && ggml_cuda_norm_1024_mode() == 1)) {
         const dim3 block_dims(WARP_SIZE, 1, 1);
-        if (residual_dst) {
-            norm_residual_f32<WARP_SIZE, true, true, true><<<blocks_num, block_dims, 0, stream>>>(
-                x0, x1, dst, ncols, stride0_row, stride0_channel, stride0_sample, stride1_row, stride1_channel,
-                stride1_sample, stride_dst_row, stride_dst_channel, stride_dst_sample, residual_dst,
-                stride_residual_row, stride_residual_channel, stride_residual_sample, eps, mul, mul_stride_row,
-                mul_stride_channel, mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed,
-                mul_nsamples_packed, add, add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed,
-                add_nrows_packed, add_nchannels_packed, add_nsamples_packed);
+        if (affine_axis0_1024 && residual_dst) {
+            GGML_CUDA_LAUNCH_NORM_RESIDUAL_1024_AFFINE_AXIS0(WARP_SIZE, true, 0);
+        } else if (affine_axis0_1024) {
+            GGML_CUDA_LAUNCH_NORM_RESIDUAL_1024_AFFINE_AXIS0(WARP_SIZE, false, 0);
+        } else if (residual_dst) {
+            GGML_CUDA_LAUNCH_NORM_RESIDUAL(WARP_SIZE, true, 0);
         } else {
-            norm_residual_f32<WARP_SIZE, true, true><<<blocks_num, block_dims, 0, stream>>>(
-                x0, x1, dst, ncols, stride0_row, stride0_channel, stride0_sample, stride1_row, stride1_channel,
-                stride1_sample, stride_dst_row, stride_dst_channel, stride_dst_sample, nullptr, 0, 0, 0, eps, mul,
-                mul_stride_row, mul_stride_channel, mul_stride_sample, mul_ncols_packed, mul_nrows_packed,
-                mul_nchannels_packed, mul_nsamples_packed, add, add_stride_row, add_stride_channel, add_stride_sample,
-                add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed);
+            GGML_CUDA_LAUNCH_NORM_RESIDUAL(WARP_SIZE, false, 0);
         }
     } else if (ncols == 1024 && ggml_cuda_norm_1024_mode() == 2) {
         const dim3 block_dims(256, 1, 1);
-        if (residual_dst) {
-            norm_residual_f32<256, true, true, true><<<blocks_num, block_dims, 32 * sizeof(float2), stream>>>(
-                x0, x1, dst, ncols, stride0_row, stride0_channel, stride0_sample, stride1_row, stride1_channel,
-                stride1_sample, stride_dst_row, stride_dst_channel, stride_dst_sample, residual_dst,
-                stride_residual_row, stride_residual_channel, stride_residual_sample, eps, mul, mul_stride_row,
-                mul_stride_channel, mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed,
-                mul_nsamples_packed, add, add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed,
-                add_nrows_packed, add_nchannels_packed, add_nsamples_packed);
+        if (affine_axis0_1024 && residual_dst) {
+            GGML_CUDA_LAUNCH_NORM_RESIDUAL_1024_AFFINE_AXIS0(256, true, 32 * sizeof(float2));
+        } else if (affine_axis0_1024) {
+            GGML_CUDA_LAUNCH_NORM_RESIDUAL_1024_AFFINE_AXIS0(256, false, 32 * sizeof(float2));
+        } else if (residual_dst) {
+            GGML_CUDA_LAUNCH_NORM_RESIDUAL(256, true, 32 * sizeof(float2));
         } else {
-            norm_residual_f32<256, true, true><<<blocks_num, block_dims, 32 * sizeof(float2), stream>>>(
-                x0, x1, dst, ncols, stride0_row, stride0_channel, stride0_sample, stride1_row, stride1_channel,
-                stride1_sample, stride_dst_row, stride_dst_channel, stride_dst_sample, nullptr, 0, 0, 0, eps, mul,
-                mul_stride_row, mul_stride_channel, mul_stride_sample, mul_ncols_packed, mul_nrows_packed,
-                mul_nchannels_packed, mul_nsamples_packed, add, add_stride_row, add_stride_channel, add_stride_sample,
-                add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed);
+            GGML_CUDA_LAUNCH_NORM_RESIDUAL(256, false, 32 * sizeof(float2));
         }
     } else {
         const dim3 block_dims(1024, 1, 1);
-        if (residual_dst) {
-            norm_residual_f32<1024, true, true, true><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float2): 0, stream>>>(
-                x0, x1, dst, ncols, stride0_row, stride0_channel, stride0_sample, stride1_row, stride1_channel,
-                stride1_sample, stride_dst_row, stride_dst_channel, stride_dst_sample, residual_dst,
-                stride_residual_row, stride_residual_channel, stride_residual_sample, eps, mul, mul_stride_row,
-                mul_stride_channel, mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed,
-                mul_nsamples_packed, add, add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed,
-                add_nrows_packed, add_nchannels_packed, add_nsamples_packed);
+        if (affine_axis0_1024 && residual_dst) {
+            GGML_CUDA_LAUNCH_NORM_RESIDUAL_1024_AFFINE_AXIS0(1024, true, block_dims.x > WARP_SIZE ? 32 * sizeof(float2) : 0);
+        } else if (affine_axis0_1024) {
+            GGML_CUDA_LAUNCH_NORM_RESIDUAL_1024_AFFINE_AXIS0(1024, false, block_dims.x > WARP_SIZE ? 32 * sizeof(float2) : 0);
+        } else if (residual_dst) {
+            GGML_CUDA_LAUNCH_NORM_RESIDUAL(1024, true, block_dims.x > WARP_SIZE ? 32 * sizeof(float2) : 0);
         } else {
-            norm_residual_f32<1024, true, true><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float2): 0, stream>>>(
-                x0, x1, dst, ncols, stride0_row, stride0_channel, stride0_sample, stride1_row, stride1_channel,
-                stride1_sample, stride_dst_row, stride_dst_channel, stride_dst_sample, nullptr, 0, 0, 0, eps, mul,
-                mul_stride_row, mul_stride_channel, mul_stride_sample, mul_ncols_packed, mul_nrows_packed,
-                mul_nchannels_packed, mul_nsamples_packed, add, add_stride_row, add_stride_channel, add_stride_sample,
-                add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed);
+            GGML_CUDA_LAUNCH_NORM_RESIDUAL(1024, false, block_dims.x > WARP_SIZE ? 32 * sizeof(float2) : 0);
         }
     }
+
+#undef GGML_CUDA_LAUNCH_NORM_RESIDUAL
+#undef GGML_CUDA_LAUNCH_NORM_RESIDUAL_TYPED
+#undef GGML_CUDA_LAUNCH_NORM_RESIDUAL_1024_AFFINE_AXIS0
+#undef GGML_CUDA_LAUNCH_NORM_RESIDUAL_1024_AFFINE_AXIS0_TYPED
 }
 
 static void group_norm_f32_cuda(
@@ -834,7 +1273,8 @@ void ggml_cuda_op_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
 void ggml_cuda_op_norm_fused_add(ggml_backend_cuda_context & ctx,
                                  ggml_tensor *               dst,
                                  ggml_tensor *               mul_tensor,
-                                 ggml_tensor *               add_tensor) {
+                                 ggml_tensor *               add_tensor,
+                                 ggml_tensor *               cpy_tensor) {
     const ggml_tensor * norm_src = (ggml_tensor *) dst->src[0];
     float eps = 0.0f;
 
@@ -909,6 +1349,26 @@ void ggml_cuda_op_norm_fused_add(ggml_backend_cuda_context & ctx,
     const int add_nchannels = add_src->ne[2];
     const int add_nsamples  = add_src->ne[3];
 
+    ggml_type side_type = GGML_TYPE_COUNT;
+    void * side_dst = nullptr;
+    int64_t side_s01 = 0;
+    int64_t side_s02 = 0;
+    int64_t side_s03 = 0;
+    if (cpy_tensor != nullptr) {
+        ggml_tensor * cpy_dst = cpy_tensor->src[1];
+        if (cpy_tensor->src[0] == add_tensor && cpy_dst != nullptr &&
+            (cpy_dst->type == GGML_TYPE_BF16 || cpy_dst->type == GGML_TYPE_F16) &&
+            ggml_are_same_shape(cpy_dst, add_tensor) && ggml_is_contiguous(cpy_dst)) {
+            side_type = cpy_dst->type;
+            side_dst = cpy_dst->data;
+            const size_t ts_side = ggml_type_size(cpy_dst->type);
+            GGML_ASSERT(cpy_dst->nb[0] == ts_side);
+            side_s01 = cpy_dst->nb[1] / ts_side;
+            side_s02 = cpy_dst->nb[2] / ts_side;
+            side_s03 = cpy_dst->nb[3] / ts_side;
+        }
+    }
+
     norm_mul_f32_cuda(src0_d, mul_d, add_d, dst_d,
                       ne00, ne01, ne02, ne03,
                       /*s00*/ s01, s02, s03,
@@ -916,7 +1376,7 @@ void ggml_cuda_op_norm_fused_add(ggml_backend_cuda_context & ctx,
                       mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
                       /*add_s00*/ add_s01, add_s02, add_s03,
                       add_ncols, add_nrows, add_nchannels, add_nsamples,
-                      eps, stream);
+                      eps, stream, side_type, side_dst, side_s01, side_s02, side_s03);
 }
 
 void ggml_cuda_op_add_norm_fused_add(ggml_backend_cuda_context & ctx,
@@ -924,7 +1384,8 @@ void ggml_cuda_op_add_norm_fused_add(ggml_backend_cuda_context & ctx,
                                      ggml_tensor *               norm_tensor,
                                      ggml_tensor *               mul_tensor,
                                      ggml_tensor *               add_tensor,
-                                     const bool                  preserve_add_output) {
+                                     const bool                  preserve_add_output,
+                                     ggml_tensor *               cpy_tensor) {
     const ggml_tensor * add_src0 = add_input->src[0];
     const ggml_tensor * add_src1 = add_input->src[1];
     GGML_ASSERT(norm_tensor->src[0] == add_input);
@@ -964,7 +1425,8 @@ void ggml_cuda_op_add_norm_fused_add(ggml_backend_cuda_context & ctx,
     cudaStream_t stream = ctx.stream();
 
     GGML_ASSERT(add_src0->type == GGML_TYPE_F32);
-    GGML_ASSERT(add_src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(add_src1->type == GGML_TYPE_F32 || add_src1->type == GGML_TYPE_BF16 ||
+                add_src1->type == GGML_TYPE_F16);
     GGML_ASSERT(add_input->type == GGML_TYPE_F32);
     GGML_ASSERT(norm_tensor->type == GGML_TYPE_F32);
     GGML_ASSERT(mul_tensor->type == GGML_TYPE_F32);
@@ -996,6 +1458,26 @@ void ggml_cuda_op_add_norm_fused_add(ggml_backend_cuda_context & ctx,
     const int64_t sr_01 = add_input->nb[1] / ts_residual;
     const int64_t sr_02 = add_input->nb[2] / ts_residual;
     const int64_t sr_03 = add_input->nb[3] / ts_residual;
+
+    ggml_type side_type = GGML_TYPE_COUNT;
+    void * side_dst = nullptr;
+    int64_t ss_01 = 0;
+    int64_t ss_02 = 0;
+    int64_t ss_03 = 0;
+    if (cpy_tensor != nullptr) {
+        ggml_tensor * cpy_dst = cpy_tensor->src[1];
+        if (cpy_tensor->src[0] == add_tensor && cpy_dst != nullptr &&
+            (cpy_dst->type == GGML_TYPE_BF16 || cpy_dst->type == GGML_TYPE_F16) &&
+            ggml_are_same_shape(cpy_dst, add_tensor) && ggml_is_contiguous(cpy_dst)) {
+            side_type = cpy_dst->type;
+            side_dst = cpy_dst->data;
+            const size_t ts_side = ggml_type_size(cpy_dst->type);
+            GGML_ASSERT(cpy_dst->nb[0] == ts_side);
+            ss_01 = cpy_dst->nb[1] / ts_side;
+            ss_02 = cpy_dst->nb[2] / ts_side;
+            ss_03 = cpy_dst->nb[3] / ts_side;
+        }
+    }
 
     const size_t ts_mul = ggml_type_size(mul_src->type);
     GGML_ASSERT(mul_src->nb[0] == ts_mul);
@@ -1030,7 +1512,7 @@ void ggml_cuda_op_add_norm_fused_add(ggml_backend_cuda_context & ctx,
                                mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
                                add_s01, add_s02, add_s03,
                                add_ncols, add_nrows, add_nchannels, add_nsamples,
-                               eps, stream);
+                               eps, stream, add_src1->type, side_type, side_dst, ss_01, ss_02, ss_03);
 }
 
 void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
