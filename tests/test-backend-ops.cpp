@@ -4952,8 +4952,8 @@ struct test_conv_transpose_2d : public test_case {
     }
 
     test_conv_transpose_2d(
-        std::array<int64_t, 4> ne_input = {10, 10, 3, 1}, // [input_width, input_height, input_channels, 1]
-        std::array<int64_t, 4> ne_kernel = {3, 3, 3, 1}, // [kernel_width, kernel_height, input_channels, 1]
+        std::array<int64_t, 4> ne_input = {10, 10, 3, 1}, // [input_width, input_height, input_channels, batch]
+        std::array<int64_t, 4> ne_kernel = {3, 3, 1, 3}, // [kernel_width, kernel_height, output_channels, input_channels]
         int stride = 1,
         ggml_type kernel_type = GGML_TYPE_F16
     ) : ne_input(ne_input), ne_kernel(ne_kernel), stride(stride), kernel_type(kernel_type) {}
@@ -7834,6 +7834,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_conv_transpose_1d({2,1,1,1}, {3,1,1,1}, 1, 0, 1));
 
     for (ggml_type kernel_type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        test_cases.emplace_back(new test_conv_transpose_2d({7, 5, 3, 1}, {2, 2, 4, 3}, 2, kernel_type));
+        test_cases.emplace_back(new test_conv_transpose_2d({7, 5, 3, 2}, {2, 2, 4, 3}, 2, kernel_type));
         test_cases.emplace_back(new test_conv_transpose_2d({3, 2, 3, 1}, {2, 2, 1, 3}, 1, kernel_type));
         test_cases.emplace_back(new test_conv_transpose_2d({10, 10, 9, 1}, {3, 3, 1, 9}, 2, kernel_type));
         test_cases.emplace_back(new test_conv_transpose_2d({129, 63, 35, 1}, {3, 3, 48, 35}, 1, kernel_type));
