@@ -11,6 +11,7 @@
 #endif
 
 #include <cstring>
+#include <limits>
 
 static __global__ void fattn_pad_head56_to64_f32(const float* __restrict__ src,
                                                  float* __restrict__ dst,
@@ -546,6 +547,16 @@ static void ggml_cuda_flash_attn_ext_head56_pad_mma_f16(ggml_backend_cuda_contex
 static void ggml_cuda_flash_attn_ext_head72_pad_mma_f16(ggml_backend_cuda_context& ctx,
                                                         ggml_tensor* dst);
 static bool ggml_cuda_name_matches_csv(const char* name, const char* csv);
+
+static bool ggml_cuda_fattn_head56_inline_f32_compatible(const ggml_tensor* tensor) {
+    constexpr size_t max_kernel_stride = std::numeric_limits<int32_t>::max();
+    return tensor != nullptr && tensor->type == GGML_TYPE_F32 && tensor->data != nullptr &&
+           tensor->nb[0] == sizeof(float) && tensor->nb[1] % sizeof(float2) == 0 &&
+           tensor->nb[2] % sizeof(float2) == 0 && tensor->nb[3] % sizeof(float2) == 0 &&
+           tensor->nb[1] <= max_kernel_stride && tensor->nb[2] <= max_kernel_stride &&
+           tensor->nb[3] <= max_kernel_stride &&
+           reinterpret_cast<uintptr_t>(tensor->data) % alignof(float2) == 0;
+}
 
 template <int DKQ,
           int DV,
@@ -1236,8 +1247,9 @@ static void ggml_cuda_flash_attn_ext_head56_pad_mma_f16(ggml_backend_cuda_contex
     GGML_ASSERT(dst->src[3] == nullptr);
     GGML_ASSERT(dst->src[4] == nullptr);
 
-    const bool direct_head56_output =
-        getenv("GGML_CUDA_DISABLE_FATTN56_DIRECT_OUT") == nullptr && ggml_is_contiguous(dst);
+    const bool direct_head56_output = getenv("GGML_CUDA_DISABLE_FATTN56_DIRECT_OUT") == nullptr &&
+                                      ggml_is_contiguous(dst) && dst->data != nullptr &&
+                                      reinterpret_cast<uintptr_t>(dst->data) % alignof(float2) == 0;
     const bool native_v56_mma =
         direct_head56_output && getenv("GGML_CUDA_ENABLE_FATTN56_NATIVE_V") != nullptr;
     const bool same_qkv_shape = Q->ne[1] == K->ne[1] && Q->ne[1] == V->ne[1] &&
@@ -1248,7 +1260,10 @@ static void ggml_cuda_flash_attn_ext_head56_pad_mma_f16(ggml_backend_cuda_contex
     const bool no_mask_no_sinks56 = getenv("GGML_CUDA_DISABLE_FATTN56_NOMASK_FAST") == nullptr;
     cudaStream_t stream = ctx.stream();
     const bool profile_fattn56 = getenv("GGML_CUDA_PROFILE_FATTN56") != nullptr;
-    if (direct_head56_output && !native_v56_mma &&
+    const bool inline_head56_f32_compatible = ggml_cuda_fattn_head56_inline_f32_compatible(Q) &&
+                                              ggml_cuda_fattn_head56_inline_f32_compatible(K) &&
+                                              ggml_cuda_fattn_head56_inline_f32_compatible(V);
+    if (direct_head56_output && inline_head56_f32_compatible && !native_v56_mma &&
         (!large_single_sequence_kv || inline_pack_large) &&
         getenv("GGML_CUDA_DISABLE_FATTN56_INLINE_PACK") == nullptr) {
         cudaEvent_t profile_start = nullptr;

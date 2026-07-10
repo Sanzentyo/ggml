@@ -143,7 +143,9 @@ namespace {
 struct cudnn_handle_deleter {
     void operator()(std::remove_pointer_t<cudnnHandle_t>* handle) const {
         if (handle != nullptr) {
-            cudnnDestroy(handle);
+            ggml_cuda_run_with_capture_barrier(
+                [](void* user_data) { cudnnDestroy(static_cast<cudnnHandle_t>(user_data)); },
+                handle);
         }
     }
 };

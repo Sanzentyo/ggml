@@ -10,6 +10,9 @@ static bool ggml_cuda_win_part_f32_vec4_compatible(const ggml_tensor* src0,
                                                    const ggml_tensor* dst) {
     return src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
            ggml_cuda_win_part_vec4_enabled() && src0->ne[0] % 4 == 0 && dst->ne[0] % 4 == 0 &&
+           src0->data != nullptr && dst->data != nullptr &&
+           reinterpret_cast<uintptr_t>(src0->data) % alignof(float4) == 0 &&
+           reinterpret_cast<uintptr_t>(dst->data) % alignof(float4) == 0 &&
            src0->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float) &&
            src0->nb[1] % sizeof(float4) == 0 && src0->nb[2] % sizeof(float4) == 0 &&
            src0->nb[3] % sizeof(float4) == 0 && ggml_is_contiguous(dst);
@@ -536,7 +539,8 @@ bool ggml_cuda_op_win_unpart_add(ggml_backend_cuda_context& ctx,
     const int64_t total = win_unpart_node->ne[0] * win_unpart_node->ne[1] * win_unpart_node->ne[2] *
                           win_unpart_node->ne[3];
 
-    if (!ggml_cuda_win_part_f32_vec4_compatible(src0, win_unpart_node) || total % 4 != 0) {
+    if (!ggml_cuda_win_part_f32_vec4_compatible(src0, add_node) || total % 4 != 0 ||
+        reinterpret_cast<uintptr_t>(residual->data) % alignof(float4) != 0) {
         return false;
     }
 

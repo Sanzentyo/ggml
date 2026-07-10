@@ -3,6 +3,8 @@
 #include "mma.cuh"
 #include "fattn-common.cuh"
 
+#include <atomic>
+
 using namespace ggml_cuda_mma;
 
 // Config options for the MMA kernel.
@@ -1956,10 +1958,11 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         }
 
 #if !defined(GGML_USE_MUSA)
-        static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
-        if (!shared_memory_limit_raised[id]) {
+        static std::atomic_bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES][2] = {};
+        const int kernel_variant = native_f16_q ? 1 : 0;
+        if (!shared_memory_limit_raised[id][kernel_variant].load(std::memory_order_acquire)) {
             CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
-            shared_memory_limit_raised[id] = true;
+            shared_memory_limit_raised[id][kernel_variant].store(true, std::memory_order_release);
         }
 #endif // !defined(GGML_USE_MUSA)
     } else {
@@ -1973,10 +1976,11 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         }
 
 #if !defined(GGML_USE_MUSA)
-        static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
-        if (!shared_memory_limit_raised[id]) {
+        static std::atomic_bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES][2] = {};
+        const int kernel_variant = native_f16_q ? 1 : 0;
+        if (!shared_memory_limit_raised[id][kernel_variant].load(std::memory_order_acquire)) {
             CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
-            shared_memory_limit_raised[id] = true;
+            shared_memory_limit_raised[id][kernel_variant].store(true, std::memory_order_release);
         }
 #endif // !defined(GGML_USE_MUSA)
     }

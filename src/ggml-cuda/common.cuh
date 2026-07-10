@@ -1191,6 +1191,9 @@ const ggml_cuda_device_info& ggml_cuda_info();
 void ggml_cuda_set_device(int device);
 int ggml_cuda_get_device();
 
+using ggml_cuda_capture_barrier_fn = void (*)(void*);
+void ggml_cuda_run_with_capture_barrier(ggml_cuda_capture_barrier_fn fn, void* user_data);
+
 struct ggml_cuda_pool {
     virtual ~ggml_cuda_pool() = default;
 

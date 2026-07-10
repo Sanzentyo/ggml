@@ -1959,8 +1959,7 @@ void ggml_cuda_op_cont_rope_pair_fused(ggml_backend_cuda_context& ctx,
                                        const ggml_tensor* cos,
                                        const ggml_tensor* sin,
                                        ggml_tensor* dst) {
-    GGML_ASSERT(x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F16 ||
-                x->type == GGML_TYPE_BF16);
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
     GGML_ASSERT(cos->type == GGML_TYPE_F32);
     GGML_ASSERT(sin->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == x->type);
@@ -1982,16 +1981,8 @@ void ggml_cuda_op_cont_rope_pair_fused(ggml_backend_cuda_context& ctx,
     const int block_size = 256;
     const int blocks = (total + block_size - 1) / block_size;
 
-    if (x->type == GGML_TYPE_F16) {
-        launch_cont_rope_pair_fused<half, half>(
-            ctx, x, cos, sin, dst, half_dim, n_tokens, n_heads, n_batches, block_size, blocks);
-    } else if (x->type == GGML_TYPE_BF16) {
-        launch_cont_rope_pair_fused<nv_bfloat16, nv_bfloat16>(
-            ctx, x, cos, sin, dst, half_dim, n_tokens, n_heads, n_batches, block_size, blocks);
-    } else {
-        launch_cont_rope_pair_fused<float, float>(
-            ctx, x, cos, sin, dst, half_dim, n_tokens, n_heads, n_batches, block_size, blocks);
-    }
+    launch_cont_rope_pair_fused<float, float>(
+        ctx, x, cos, sin, dst, half_dim, n_tokens, n_heads, n_batches, block_size, blocks);
 }
 
 void ggml_cuda_op_repeat_back(ggml_backend_cuda_context& ctx, ggml_tensor* dst) {

@@ -27,7 +27,9 @@ constexpr int64_t FC1_OUT_UID = 4;
 struct cudnn_handle_deleter {
     void operator()(std::remove_pointer_t<cudnnHandle_t>* handle) const {
         if (handle != nullptr) {
-            cudnnDestroy(handle);
+            ggml_cuda_run_with_capture_barrier(
+                [](void* user_data) { cudnnDestroy(static_cast<cudnnHandle_t>(user_data)); },
+                handle);
         }
     }
 };
@@ -36,6 +38,7 @@ using cudnn_handle_ptr =
     std::unique_ptr<std::remove_pointer_t<cudnnHandle_t>, cudnn_handle_deleter>;
 
 struct graph_key {
+    int device = 0;
     int64_t input_dim = 0;
     int64_t hidden_dim = 0;
     int64_t cols = 0;
@@ -43,8 +46,9 @@ struct graph_key {
     ggml_type output_type = GGML_TYPE_BF16;
 
     bool operator==(const graph_key& other) const {
-        return std::tie(input_dim, hidden_dim, cols, input_type, output_type) ==
-               std::tie(other.input_dim,
+        return std::tie(device, input_dim, hidden_dim, cols, input_type, output_type) ==
+               std::tie(other.device,
+                        other.input_dim,
                         other.hidden_dim,
                         other.cols,
                         other.input_type,
@@ -59,6 +63,7 @@ struct graph_key_hash {
             h ^= v;
             h *= 1099511628211ULL;
         };
+        mix(static_cast<uint64_t>(key.device));
         mix(static_cast<uint64_t>(key.input_dim));
         mix(static_cast<uint64_t>(key.hidden_dim));
         mix(static_cast<uint64_t>(key.cols));
@@ -191,7 +196,13 @@ static cudnnHandle_t get_handle(int device) {
 }
 
 static const char* output_suffix(ggml_type output_type) {
-    return output_type == GGML_TYPE_F32 ? "F32" : "BF16";
+    if (output_type == GGML_TYPE_F32) {
+        return "F32";
+    }
+    if (output_type == GGML_TYPE_F16) {
+        return "F16";
+    }
+    return "BF16";
 }
 
 static bool env_enabled(const char* name) {
@@ -205,6 +216,9 @@ static bool should_log(ggml_type output_type) {
     }
     if (output_type == GGML_TYPE_F32) {
         return std::getenv("GGML_CUDA_PROFILE_CUDNN_MLP_FC1_GELU_F32") != nullptr;
+    }
+    if (output_type == GGML_TYPE_F16) {
+        return std::getenv("GGML_CUDA_PROFILE_CUDNN_MLP_FC1_GELU_F16") != nullptr;
     }
     return std::getenv("GGML_CUDA_PROFILE_CUDNN_MLP_FC1_GELU_BF16") != nullptr;
 }
@@ -253,11 +267,14 @@ static bool is_supported_shape(const ggml_tensor* mm_node,
         return reject("null-src", mm_node, bias, dst, output_type);
     }
     const bool dst_type_ok = (output_type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_BF16) ||
+                             (output_type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16) ||
                              (output_type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
-    const bool input_type_ok =
-        src0->type == src1->type && (src0->type == GGML_TYPE_BF16 ||
-                                     (output_type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F16));
-    if (!input_type_ok || bias->type != GGML_TYPE_F32 || !dst_type_ok) {
+    const bool input_type_ok = src0->type == src1->type &&
+                               (src0->type == GGML_TYPE_BF16 ||
+                                ((output_type == GGML_TYPE_F16 || output_type == GGML_TYPE_F32) &&
+                                 src0->type == GGML_TYPE_F16));
+    if (!input_type_ok || mm_node->type != GGML_TYPE_F32 || bias->type != GGML_TYPE_F32 ||
+        !dst_type_ok) {
         return reject("type", mm_node, bias, dst, output_type);
     }
     if (std::strstr(src0->name, "vit.blocks.") == nullptr ||
@@ -293,7 +310,7 @@ static bool ggml_cuda_cudnn_mlp_fc1_gelu(ggml_backend_cuda_context& ctx,
     if (env_enabled(disable_env)) {
         return false;
     }
-    const bool default_enabled = output_type == GGML_TYPE_BF16;
+    const bool default_enabled = output_type == GGML_TYPE_BF16 || output_type == GGML_TYPE_F16;
     const bool explicit_enabled = env_enabled(enable_env);
     const bool unsafe_enabled = env_enabled(unsafe_env);
     if (!default_enabled && (!explicit_enabled || !unsafe_enabled)) {
@@ -306,6 +323,7 @@ static bool ggml_cuda_cudnn_mlp_fc1_gelu(ggml_backend_cuda_context& ctx,
     const ggml_tensor* src0 = mm_node->src[0];
     const ggml_tensor* src1 = mm_node->src[1];
     const graph_key key{
+        ctx.device,
         src0->ne[0],
         src0->ne[1],
         ggml_nelements(dst) / dst->ne[0],
@@ -354,7 +372,8 @@ static bool ggml_cuda_cudnn_mlp_fc1_gelu(ggml_backend_cuda_context& ctx,
             CUDA_CHECK(cudaEventDestroy(start));
             CUDA_CHECK(cudaEventDestroy(stop));
         }
-        return reject("execute", mm_node, bias, dst, output_type);
+        reject("execute", mm_node, bias, dst, output_type);
+        GGML_ABORT("cuDNN MLP graph execution failed");
     }
     CUDA_CHECK(cudaGetLastError());
 
@@ -408,4 +427,18 @@ bool ggml_cuda_cudnn_mlp_fc1_gelu_f32(ggml_backend_cuda_context& ctx,
                                         "GGML_CUDA_ENABLE_CUDNN_MLP_FC1_GELU_F32",
                                         "GGML_CUDA_ENABLE_CUDNN_MLP_FC1_GELU_F32_UNSAFE_RUN",
                                         "GGML_CUDA_DISABLE_CUDNN_MLP_FC1_GELU_F32");
+}
+
+bool ggml_cuda_cudnn_mlp_fc1_gelu_f16(ggml_backend_cuda_context& ctx,
+                                      const ggml_tensor* mm_node,
+                                      const ggml_tensor* bias,
+                                      ggml_tensor* dst) {
+    return ggml_cuda_cudnn_mlp_fc1_gelu(ctx,
+                                        mm_node,
+                                        bias,
+                                        dst,
+                                        GGML_TYPE_F16,
+                                        "GGML_CUDA_ENABLE_CUDNN_MLP_FC1_GELU_F16",
+                                        "GGML_CUDA_ENABLE_CUDNN_MLP_FC1_GELU_F16_UNSAFE_RUN",
+                                        "GGML_CUDA_DISABLE_CUDNN_MLP_FC1_GELU_F16");
 }
