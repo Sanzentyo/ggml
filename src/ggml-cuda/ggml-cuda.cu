@@ -6812,6 +6812,94 @@ static bool ggml_cuda_can_fuse_norm_affine_nonseq(const ggml_cgraph* cgraph,
     return true;
 }
 
+static bool ggml_cuda_can_fuse_group_norm_affine_relu(const ggml_cgraph* cgraph,
+                                                      const int group_norm_idx,
+                                                      int* mul_idx_out,
+                                                      int* add_idx_out,
+                                                      int* relu_idx_out) {
+    const int mul_idx = ggml_cuda_next_nontrivial_node(cgraph, group_norm_idx + 1);
+    const int add_idx = mul_idx >= 0 ? ggml_cuda_next_nontrivial_node(cgraph, mul_idx + 1) : -1;
+    const int relu_idx = add_idx >= 0 ? ggml_cuda_next_nontrivial_node(cgraph, add_idx + 1) : -1;
+    if (mul_idx < 0 || add_idx < 0 || relu_idx < 0) {
+        return false;
+    }
+
+    const int idxs[4] = {group_norm_idx, mul_idx, add_idx, relu_idx};
+    const ggml_op ops[4] = {GGML_OP_GROUP_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_UNARY};
+    const int outputs[1] = {relu_idx};
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, 4, ops, outputs, 1)) {
+        return false;
+    }
+
+    const ggml_tensor* group_norm = cgraph->nodes[group_norm_idx];
+    const ggml_tensor* mul = cgraph->nodes[mul_idx];
+    const ggml_tensor* add = cgraph->nodes[add_idx];
+    const ggml_tensor* relu = cgraph->nodes[relu_idx];
+    const ggml_tensor* src = group_norm->src[0];
+    if (src == nullptr || ggml_get_unary_op(relu) != GGML_UNARY_OP_RELU || relu->src[0] != add) {
+        return false;
+    }
+
+    if (mul->src[0] != group_norm || add->src[0] != mul) {
+        return false;
+    }
+    const ggml_tensor* gamma = mul->src[1];
+    const ggml_tensor* beta = add->src[1];
+    if (gamma == nullptr || beta == nullptr) {
+        return false;
+    }
+
+    // This path is deliberately limited to the two SAM3 pixel-decoder activations. Keeping batch
+    // size one also makes blockIdx.x map directly to the channel group in the fused kernel.
+    const bool sam3_pixel_shape = src->ne[0] == src->ne[1] &&
+                                  (src->ne[0] == 144 || src->ne[0] == 288) && src->ne[2] == 256 &&
+                                  src->ne[3] == 1;
+    if (!sam3_pixel_shape || group_norm->op_params[0] != 8) {
+        return false;
+    }
+
+    const ggml_tensor* chain[5] = {src, group_norm, mul, add, relu};
+    for (const ggml_tensor* tensor : chain) {
+        if (tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor) ||
+            !ggml_are_same_shape(tensor, src)) {
+            return false;
+        }
+    }
+    if (src->view_src != nullptr || group_norm->view_src != nullptr || mul->view_src != nullptr ||
+        add->view_src != nullptr || relu->view_src != nullptr) {
+        return false;
+    }
+
+    const auto is_channel_broadcast = [](const ggml_tensor* tensor) {
+        return tensor->type == GGML_TYPE_F32 && ggml_is_contiguous(tensor) && tensor->ne[0] == 1 &&
+               tensor->ne[1] == 1 && tensor->ne[2] == 256 && tensor->ne[3] == 1;
+    };
+    if (!is_channel_broadcast(gamma) || !is_channel_broadcast(beta)) {
+        return false;
+    }
+
+    // The fused kernel writes centered values to its final destination before the variance pass,
+    // so even an exact alias with an external source is unsafe. Check leaf sources as well as
+    // partial overlaps through parameter reshapes.
+    if (!ggml_cuda_check_fusion_memory_ranges(cgraph,
+                                              group_norm_idx,
+                                              relu_idx - group_norm_idx + 1,
+                                              outputs,
+                                              1,
+                                              /*is_topk_moe=*/false,
+                                              /*allowed_exact_overlap_src=*/nullptr,
+                                              /*allowed_exact_overlap_node=*/nullptr,
+                                              /*allowed_exact_overlap_src_index=*/-1,
+                                              /*check_leaf_sources=*/true)) {
+        return false;
+    }
+
+    *mul_idx_out = mul_idx;
+    *add_idx_out = add_idx;
+    *relu_idx_out = relu_idx;
+    return true;
+}
+
 static bool ggml_cuda_can_fuse_add_norm_affine_shapes(const ggml_cgraph* cgraph, const int* idxs);
 
 static uintptr_t ggml_cuda_tensor_range_end(const ggml_tensor* tensor) {
@@ -7432,6 +7520,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context* cuda_ctx, ggml_cgraph* 
 
     static const bool disable_norm_fusion = getenv("GGML_CUDA_DISABLE_NORM_FUSION") != nullptr &&
                                             std::atoi(getenv("GGML_CUDA_DISABLE_NORM_FUSION"));
+    static const bool disable_group_norm_affine_relu_fusion =
+        getenv("GGML_CUDA_DISABLE_GROUP_NORM_AFFINE_RELU_FUSION") != nullptr &&
+        std::atoi(getenv("GGML_CUDA_DISABLE_GROUP_NORM_AFFINE_RELU_FUSION"));
+    static const bool profile_group_norm_affine_relu_fusion =
+        getenv("GGML_CUDA_PROFILE_GROUP_NORM_AFFINE_RELU_FUSION") != nullptr;
     static const bool disable_add_norm_fusion =
         getenv("GGML_CUDA_DISABLE_ADD_NORM_FUSION") != nullptr &&
         std::atoi(getenv("GGML_CUDA_DISABLE_ADD_NORM_FUSION"));
@@ -8583,6 +8676,42 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context* cuda_ctx, ggml_cgraph* 
 
     if (fused_mul_mat_vec) {
         return fused_node_count - 1;
+    }
+
+    if (!disable_group_norm_affine_relu_fusion && node->op == GGML_OP_GROUP_NORM) {
+        int mul_idx = -1;
+        int add_idx = -1;
+        int relu_idx = -1;
+        if (ggml_cuda_can_fuse_group_norm_affine_relu(cgraph, i, &mul_idx, &add_idx, &relu_idx)) {
+            if (profile_group_norm_affine_relu_fusion) {
+                fprintf(stderr,
+                        "GGML_CUDA_GROUP_NORM_AFFINE_RELU success norm=%s relu=%s "
+                        "shape=[%lld,%lld,%lld,%lld] skip=%d\n",
+                        node->name,
+                        cgraph->nodes[relu_idx]->name,
+                        (long long) node->ne[0],
+                        (long long) node->ne[1],
+                        (long long) node->ne[2],
+                        (long long) node->ne[3],
+                        relu_idx - i);
+            }
+            ggml_cuda_op_group_norm_affine_relu(*cuda_ctx,
+                                                node,
+                                                cgraph->nodes[mul_idx],
+                                                cgraph->nodes[add_idx],
+                                                cgraph->nodes[relu_idx]);
+            return relu_idx - i;
+        }
+        if (profile_group_norm_affine_relu_fusion) {
+            fprintf(stderr,
+                    "GGML_CUDA_GROUP_NORM_AFFINE_RELU reject norm=%s "
+                    "shape=[%lld,%lld,%lld,%lld]\n",
+                    node->name,
+                    (long long) node->ne[0],
+                    (long long) node->ne[1],
+                    (long long) node->ne[2],
+                    (long long) node->ne[3]);
+        }
     }
 
     if (!disable_norm_fusion && !disable_add_norm_fusion && node->op == GGML_OP_ADD) {

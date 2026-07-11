@@ -20,6 +20,12 @@ void ggml_cuda_op_add_norm_fused_add(ggml_backend_cuda_context & ctx,
 
 void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+void ggml_cuda_op_group_norm_affine_relu(ggml_backend_cuda_context& ctx,
+                                         ggml_tensor* group_norm,
+                                         ggml_tensor* mul,
+                                         ggml_tensor* add,
+                                         ggml_tensor* relu);
+
 void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor);
