@@ -42,6 +42,7 @@ struct ggml_backend_cuda_pool_stats {
 GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
 
 GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
+GGML_BACKEND_API bool ggml_backend_cuda_has_cudnn(ggml_backend_t backend);
 
 GGML_BACKEND_API bool ggml_backend_cuda_get_pool_stats(
         ggml_backend_t backend, struct ggml_backend_cuda_pool_stats * stats);

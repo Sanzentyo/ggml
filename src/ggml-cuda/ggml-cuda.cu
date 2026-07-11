@@ -9586,6 +9586,15 @@ bool ggml_backend_is_cuda(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cuda_guid());
 }
 
+bool ggml_backend_cuda_has_cudnn(ggml_backend_t backend) {
+#ifdef GGML_CUDA_USE_CUDNN
+    return ggml_backend_is_cuda(backend);
+#else
+    GGML_UNUSED(backend);
+    return false;
+#endif
+}
+
 bool ggml_backend_cuda_get_pool_stats(
     ggml_backend_t backend, ggml_backend_cuda_pool_stats* stats) {
     if (!ggml_backend_is_cuda(backend) || stats == nullptr) {
