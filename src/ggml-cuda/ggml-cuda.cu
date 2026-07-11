@@ -4688,30 +4688,6 @@ static mmq_activation ggml_cuda_mmq_activation_from_unary(const ggml_tensor* una
 
 static int ggml_cuda_next_nontrivial_node(const ggml_cgraph* cgraph, int i);
 
-static bool ggml_cuda_tensor_is_direct_src(const ggml_tensor* node, const ggml_tensor* tensor) {
-    for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
-        if (node->src[src_idx] == tensor) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool ggml_cuda_tensor_has_later_direct_consumer_except(const ggml_cgraph* cgraph,
-                                                              const int producer_idx,
-                                                              const int except_idx) {
-    const ggml_tensor* producer = cgraph->nodes[producer_idx];
-    for (int i = producer_idx + 1; i < cgraph->n_nodes; ++i) {
-        if (i == except_idx) {
-            continue;
-        }
-        if (ggml_cuda_tensor_is_direct_src(cgraph->nodes[i], producer)) {
-            return true;
-        }
-    }
-    return false;
-}
-
 static ggml_type ggml_cuda_mmq_prequant_consumer_type(const ggml_cgraph* cgraph,
                                                       const int producer_out_idx,
                                                       const bool force = false) {
@@ -4745,7 +4721,8 @@ static ggml_type ggml_cuda_mmq_prequant_consumer_type(const ggml_cgraph* cgraph,
     return consumer_weight->type;
 }
 
-static bool ggml_cuda_mmq_q8_only_producer_candidate(const ggml_cgraph* cgraph,
+static bool ggml_cuda_mmq_q8_only_producer_candidate(const ggml_backend_cuda_context& ctx,
+                                                     const ggml_cgraph* cgraph,
                                                      const int producer_out_idx) {
     if (getenv("GGML_CUDA_PROFILE_MMQ_Q8_ONLY_CANDIDATES") == nullptr &&
         getenv("GGML_CUDA_DISABLE_MMQ_Q8_ONLY_PRODUCER_FUSION") != nullptr) {
@@ -4757,6 +4734,10 @@ static bool ggml_cuda_mmq_q8_only_producer_candidate(const ggml_cgraph* cgraph,
         return false;
     }
 
+    if (!ggml_node_has_n_uses(cgraph, producer_out_idx, 1)) {
+        return false;
+    }
+
     const ggml_tensor* producer_out = cgraph->nodes[producer_out_idx];
     const ggml_tensor* consumer = cgraph->nodes[consumer_idx];
     const ggml_tensor* weight = consumer->src[0];
@@ -4765,14 +4746,49 @@ static bool ggml_cuda_mmq_q8_only_producer_candidate(const ggml_cgraph* cgraph,
         consumer->op == GGML_OP_MUL_MAT && consumer->src[1] == producer_out &&
         consumer->src[2] == nullptr && weight != nullptr &&
         (weight->type == GGML_TYPE_Q4_1 || weight->type == GGML_TYPE_Q8_0) &&
-        producer_out->type == GGML_TYPE_F32 && ggml_is_contiguous(producer_out) &&
-        producer_out->ne[2] == 1 && producer_out->ne[3] == 1;
+        producer_out->type == GGML_TYPE_F32 && consumer->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous(producer_out) && producer_out->ne[2] == 1 && producer_out->ne[3] == 1;
     if (!direct_q_mmq_consumer) {
         return false;
     }
 
-    return !ggml_cuda_tensor_has_later_direct_consumer_except(
-        cgraph, producer_out_idx, consumer_idx);
+    if (producer_out->ne[1] <= MMVQ_MAX_BATCH_SIZE || producer_out->buffer == nullptr ||
+        producer_out->data == nullptr || consumer->buffer == nullptr || consumer->data == nullptr ||
+        weight->buffer == nullptr || weight->data == nullptr ||
+        ggml_backend_buffer_get_usage(producer_out->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        return false;
+    }
+
+    const bool weight_has_unsafe_padding =
+        ggml_backend_buffer_get_usage(weight->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+        ggml_nbytes(weight) != ggml_backend_buffer_get_alloc_size(weight->buffer, weight) &&
+        weight->view_src != nullptr;
+    if (weight_has_unsafe_padding) {
+        return false;
+    }
+
+    const ggml_backend_buffer_type_t expected_buft = ggml_backend_cuda_buffer_type(ctx.device);
+    if (producer_out->buffer->buft != expected_buft || consumer->buffer->buft != expected_buft ||
+        weight->buffer->buft != expected_buft) {
+        return false;
+    }
+
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!turing_mma_available(cc) ||
+        !ggml_cuda_should_use_mmq(weight->type, cc, producer_out->ne[1], /*n_experts=*/0)) {
+        return false;
+    }
+
+    const auto producer_begin = reinterpret_cast<uintptr_t>(producer_out->data);
+    const auto producer_end = producer_begin + ggml_nbytes(producer_out);
+    const auto consumer_begin = reinterpret_cast<uintptr_t>(consumer->data);
+    const auto consumer_end = consumer_begin + ggml_nbytes(consumer);
+    const auto weight_begin = reinterpret_cast<uintptr_t>(weight->data);
+    const auto weight_end = weight_begin + ggml_nbytes(weight);
+    const bool overlaps_consumer =
+        producer_begin < consumer_end && consumer_begin < producer_end;
+    const bool overlaps_weight = producer_begin < weight_end && weight_begin < producer_end;
+    return !overlaps_consumer && !overlaps_weight;
 }
 
 static bool ggml_cuda_prepare_add_mmq_prequant_cache(ggml_backend_cuda_context& ctx,
@@ -8475,7 +8491,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context* cuda_ctx, ggml_cgraph* 
                 }
 
                 const bool q8_only_candidate =
-                    ggml_cuda_mmq_q8_only_producer_candidate(cgraph, unary_idx);
+                    ggml_cuda_mmq_q8_only_producer_candidate(*cuda_ctx, cgraph, unary_idx);
                 const bool q8_only_enabled =
                     q8_only_candidate &&
                     getenv("GGML_CUDA_DISABLE_MMQ_Q8_ONLY_PRODUCER_FUSION") == nullptr;
