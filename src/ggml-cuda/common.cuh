@@ -1561,6 +1561,8 @@ struct ggml_backend_cuda_context {
         int64_t ne1 = 0;
         int64_t ne2 = 0;
         int64_t ne3 = 0;
+        int producer_stream_no = -1;
+        bool release_after_single_use = false;
         std::unique_ptr<ggml_cuda_pool_alloc<char>> storage;
         char* data = nullptr;
     };

@@ -298,6 +298,13 @@ void ggml_cuda_mul_mat_q(
             cached_src1->second.ne3 == ne13 &&
             cached_src1->second.data != nullptr;
         if (use_cached_src1) {
+            const bool release_after_single_use =
+                cached_src1->second.release_after_single_use &&
+                getenv("GGML_CUDA_DISABLE_MMQ_Q8_ONLY_CACHE_RELEASE") == nullptr &&
+                cached_src1->second.producer_stream_no == ctx.curr_stream_no &&
+                cached_src1 == ctx.mmq_prequant_cache.end() - 1 &&
+                cached_src1->second.storage != nullptr &&
+                cached_src1->second.storage->pool == &ctx.pool();
             if (profile_mmq) {
                 CUDA_CHECK(cudaEventCreate(&profile_start));
                 CUDA_CHECK(cudaEventCreate(&profile_after_quant));
@@ -353,6 +360,9 @@ void ggml_cuda_mul_mat_q(
                 CUDA_CHECK(cudaEventDestroy(profile_after_quant));
                 CUDA_CHECK(cudaEventDestroy(profile_after_mmq));
             }
+            if (release_after_single_use) {
+                ctx.mmq_prequant_cache.pop_back();
+            }
             return;
         }
 
@@ -407,8 +417,20 @@ void ggml_cuda_mul_mat_q(
             prequant_cache_entry.ne1 = dst->ne[1];
             prequant_cache_entry.ne2 = dst->ne[2];
             prequant_cache_entry.ne3 = dst->ne[3];
-            prequant_cache_entry.storage = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), nbytes_dst_q8_1);
+            prequant_cache_entry.producer_stream_no = ctx.curr_stream_no;
+            prequant_cache_entry.release_after_single_use = q8_only_producer_fusion;
+            prequant_cache_entry.storage =
+                std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), nbytes_dst_q8_1);
             prequant_cache_entry.data = prequant_cache_entry.storage->get();
+            if (q8_only_producer_fusion &&
+                getenv("GGML_CUDA_PROFILE_MMQ_Q8_ONLY_CANDIDATES") != nullptr) {
+                fprintf(stderr,
+                        "GGML_CUDA_PROFILE_MMQ_Q8_ONLY_CACHE backing=pool "
+                        "release_eligible=1 stream=%d storage_bytes=%zu name=%s\n",
+                        ctx.curr_stream_no,
+                        nbytes_dst_q8_1,
+                        dst->name);
+            }
         }
         if (profile_mmq) {
             CUDA_CHECK(cudaEventCreate(&profile_start));
