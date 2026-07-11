@@ -19,10 +19,33 @@ extern "C" {
 #endif
 #define GGML_CUDA_MAX_DEVICES       16
 
+enum ggml_backend_cuda_pool_kind {
+    GGML_BACKEND_CUDA_POOL_NONE   = 0,
+    GGML_BACKEND_CUDA_POOL_LEGACY = 1,
+    GGML_BACKEND_CUDA_POOL_VMM    = 2,
+    GGML_BACKEND_CUDA_POOL_MIXED  = 3,
+};
+
+struct ggml_backend_cuda_pool_stats {
+    size_t   current_reserved_bytes;
+    size_t   peak_reserved_bytes;
+    size_t   current_used_bytes;
+    size_t   peak_used_bytes;
+    size_t   largest_request_bytes;
+    uint64_t allocation_count;
+    uint64_t reuse_count;
+    int      pool_kind;
+    bool     tracking_enabled;
+};
+
 // backend API
 GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
 
 GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
+
+GGML_BACKEND_API bool ggml_backend_cuda_get_pool_stats(
+        ggml_backend_t backend, struct ggml_backend_cuda_pool_stats * stats);
+GGML_BACKEND_API bool ggml_backend_cuda_reset_pool_stats(ggml_backend_t backend);
 
 // device buffer
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);

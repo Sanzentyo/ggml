@@ -22,6 +22,7 @@
 #include "ggml-common.h"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cassert>
 #include <cfloat>
@@ -1194,6 +1195,109 @@ int ggml_cuda_get_device();
 using ggml_cuda_capture_barrier_fn = void (*)(void*);
 void ggml_cuda_run_with_capture_barrier(ggml_cuda_capture_barrier_fn fn, void* user_data);
 
+struct ggml_cuda_pool_tracker {
+    bool enabled = false;
+    std::atomic<size_t> current_reserved_bytes{0};
+    std::atomic<size_t> peak_reserved_bytes{0};
+    std::atomic<size_t> current_used_bytes{0};
+    std::atomic<size_t> peak_used_bytes{0};
+    std::atomic<size_t> largest_request_bytes{0};
+    std::atomic<uint64_t> allocation_count{0};
+    std::atomic<uint64_t> reuse_count{0};
+    std::atomic<int> pool_kind{GGML_BACKEND_CUDA_POOL_NONE};
+
+    static void update_max(std::atomic<size_t> & target, size_t value) {
+        size_t observed = target.load(std::memory_order_relaxed);
+        while (observed < value &&
+               !target.compare_exchange_weak(
+                   observed, value, std::memory_order_relaxed, std::memory_order_relaxed)) {
+        }
+    }
+
+    void mark_pool_kind(int kind) {
+        if (!enabled) {
+            return;
+        }
+        int observed = pool_kind.load(std::memory_order_relaxed);
+        while (observed != kind && observed != GGML_BACKEND_CUDA_POOL_MIXED) {
+            const int desired = observed == GGML_BACKEND_CUDA_POOL_NONE
+                                    ? kind
+                                    : GGML_BACKEND_CUDA_POOL_MIXED;
+            if (pool_kind.compare_exchange_weak(
+                    observed, desired, std::memory_order_relaxed, std::memory_order_relaxed)) {
+                break;
+            }
+        }
+    }
+
+    void reserve(size_t bytes) {
+        if (!enabled || bytes == 0) {
+            return;
+        }
+        const size_t current =
+            current_reserved_bytes.fetch_add(bytes, std::memory_order_relaxed) + bytes;
+        update_max(peak_reserved_bytes, current);
+    }
+
+    void release_reserved(size_t bytes) {
+        if (!enabled || bytes == 0) {
+            return;
+        }
+        const size_t previous =
+            current_reserved_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+        GGML_ASSERT(previous >= bytes);
+    }
+
+    void allocate(size_t requested_bytes, size_t actual_bytes, bool reused) {
+        if (!enabled) {
+            return;
+        }
+        allocation_count.fetch_add(1, std::memory_order_relaxed);
+        if (reused) {
+            reuse_count.fetch_add(1, std::memory_order_relaxed);
+        }
+        update_max(largest_request_bytes, requested_bytes);
+        const size_t current =
+            current_used_bytes.fetch_add(actual_bytes, std::memory_order_relaxed) + actual_bytes;
+        update_max(peak_used_bytes, current);
+    }
+
+    void free(size_t bytes) {
+        if (!enabled) {
+            return;
+        }
+        const size_t previous = current_used_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+        GGML_ASSERT(previous >= bytes);
+    }
+
+    ggml_backend_cuda_pool_stats get_stats() const {
+        return {
+            current_reserved_bytes.load(std::memory_order_relaxed),
+            peak_reserved_bytes.load(std::memory_order_relaxed),
+            current_used_bytes.load(std::memory_order_relaxed),
+            peak_used_bytes.load(std::memory_order_relaxed),
+            largest_request_bytes.load(std::memory_order_relaxed),
+            allocation_count.load(std::memory_order_relaxed),
+            reuse_count.load(std::memory_order_relaxed),
+            pool_kind.load(std::memory_order_relaxed),
+            enabled,
+        };
+    }
+
+    void reset() {
+        if (!enabled) {
+            return;
+        }
+        peak_reserved_bytes.store(
+            current_reserved_bytes.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        peak_used_bytes.store(
+            current_used_bytes.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        largest_request_bytes.store(0, std::memory_order_relaxed);
+        allocation_count.store(0, std::memory_order_relaxed);
+        reuse_count.store(0, std::memory_order_relaxed);
+    }
+};
+
 struct ggml_cuda_pool {
     virtual ~ggml_cuda_pool() = default;
 
@@ -1524,7 +1628,13 @@ struct ggml_backend_cuda_context {
 #endif  // USE_CUDA_GRAPH
 
     explicit ggml_backend_cuda_context(int device)
-        : device(device), name(GGML_CUDA_NAME + std::to_string(device)) {}
+        : device(device), name(GGML_CUDA_NAME + std::to_string(device)) {
+        const char * track_pool = getenv("GGML_CUDA_TRACK_POOL_STATS");
+        const bool tracking_enabled = track_pool != nullptr && track_pool[0] != '0';
+        for (ggml_cuda_pool_tracker & tracker : pool_trackers) {
+            tracker.enabled = tracking_enabled;
+        }
+    }
 
     ggml_cuda_stream_context concurrent_stream_context;
 
@@ -1571,12 +1681,15 @@ struct ggml_backend_cuda_context {
 
     // pool
     std::unique_ptr<ggml_cuda_pool> pools[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS];
+    ggml_cuda_pool_tracker pool_trackers[GGML_CUDA_MAX_DEVICES];
 
-    static std::unique_ptr<ggml_cuda_pool> new_pool_for_device(int device, int stream_no);
+    static std::unique_ptr<ggml_cuda_pool> new_pool_for_device(
+        int device, int stream_no, ggml_cuda_pool_tracker & tracker);
 
     ggml_cuda_pool& pool(int device) {
         if (pools[device][curr_stream_no] == nullptr) {
-            pools[device][curr_stream_no] = new_pool_for_device(device, curr_stream_no);
+            pools[device][curr_stream_no] =
+                new_pool_for_device(device, curr_stream_no, pool_trackers[device]);
         }
         return *pools[device][curr_stream_no];
     }

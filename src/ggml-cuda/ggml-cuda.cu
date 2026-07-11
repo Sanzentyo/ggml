@@ -401,6 +401,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     static const int MAX_BUFFERS = 256;
 
     int device;
+    ggml_cuda_pool_tracker & tracker;
     struct ggml_cuda_buffer {
         void* ptr = nullptr;
         size_t size = 0;
@@ -409,7 +410,10 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     ggml_cuda_buffer buffer_pool[MAX_BUFFERS] = {};
     size_t pool_size = 0;
 
-    explicit ggml_cuda_pool_leg(int device) : device(device) {}
+    ggml_cuda_pool_leg(int device, ggml_cuda_pool_tracker & tracker)
+        : device(device), tracker(tracker) {
+        tracker.mark_pool_kind(GGML_BACKEND_CUDA_POOL_LEGACY);
+    }
 
     ~ggml_cuda_pool_leg() {
         clear_pool();
@@ -423,6 +427,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             if (b.ptr != nullptr) {
                 CUDA_CHECK(cudaFree(b.ptr));
                 pool_size -= b.size;
+                tracker.release_reserved(b.size);
                 b.ptr = nullptr;
                 b.size = 0;
             }
@@ -454,6 +459,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
                             *actual_size = b.size;
                             b.ptr = nullptr;
                             b.size = 0;
+                            tracker.allocate(size, *actual_size, true);
                             return ptr;
                         }
                     }
@@ -466,6 +472,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             *actual_size = b.size;
             b.ptr = nullptr;
             b.size = 0;
+            tracker.allocate(size, *actual_size, true);
             return ptr;
         }
         void* ptr;
@@ -492,6 +499,8 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         CUDA_CHECK(err);
         *actual_size = look_ahead_size;
         pool_size += look_ahead_size;
+        tracker.reserve(look_ahead_size);
+        tracker.allocate(size, look_ahead_size, false);
 #ifdef DEBUG_CUDA_MALLOC
         GGML_LOG_INFO("%s[%d]: %d buffers, max_size = %u MB, pool_size = %u MB, requested %u MB\n",
                       __func__,
@@ -505,6 +514,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     }
 
     void free(void* ptr, size_t size) override {
+        tracker.free(size);
         for (int i = 0; i < MAX_BUFFERS; ++i) {
             ggml_cuda_buffer& b = buffer_pool[i];
             if (b.ptr == nullptr) {
@@ -517,6 +527,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(ptr));
         pool_size -= size;
+        tracker.release_reserved(size);
     }
 };
 
@@ -526,6 +537,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
     static const size_t CUDA_POOL_VMM_MAX_SIZE = 1ull << 35;  // 32 GB
 
     int device;
+    ggml_cuda_pool_tracker & tracker;
     CUdeviceptr pool_addr = 0;
     size_t pool_used = 0;
     size_t pool_size = 0;
@@ -534,8 +546,12 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
     std::vector<std::pair<CUdeviceptr, size_t>> mappings;
 #endif
 
-    explicit ggml_cuda_pool_vmm(int device)
-        : device(device), granularity(ggml_cuda_info().devices[device].vmm_granularity) {}
+    ggml_cuda_pool_vmm(int device, ggml_cuda_pool_tracker & tracker)
+        : device(device),
+          tracker(tracker),
+          granularity(ggml_cuda_info().devices[device].vmm_granularity) {
+        tracker.mark_pool_kind(GGML_BACKEND_CUDA_POOL_VMM);
+    }
 
     ~ggml_cuda_pool_vmm() {
         if (pool_addr != 0) {
@@ -548,6 +564,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             CU_CHECK(cuMemUnmap(pool_addr, pool_size));
 #endif
             CU_CHECK(cuMemAddressFree(pool_addr, CUDA_POOL_VMM_MAX_SIZE));
+            tracker.release_reserved(pool_size);
         }
     }
 
@@ -557,9 +574,12 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         const size_t alignment = 128;
         size = alignment * ((size + alignment - 1) / alignment);
 
+        const size_t requested_size = size;
         size_t avail = pool_size - pool_used;
+        bool reused = true;
 
         if (size > avail) {
+            reused = false;
             // round up to the next multiple of the granularity
             size_t reserve_size = size - avail;
             reserve_size = granularity * ((reserve_size + granularity - 1) / granularity);
@@ -599,6 +619,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 
             // add to the pool
             pool_size += reserve_size;
+            tracker.reserve(reserve_size);
 
             // printf("cuda pool[%d]: size increased to %llu MB (reserved %llu MB)\n",
             //        device, (unsigned long long) (pool_size/1024/1024),
@@ -610,6 +631,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         void* ptr = (void*) ((CUdeviceptr) ((char*) (pool_addr) + pool_used));
         *actual_size = size;
         pool_used += size;
+        tracker.allocate(requested_size, size, reused);
 
 #ifdef DEBUG_CUDA_MALLOC
         printf("cuda pool[%d]: allocated %llu bytes at %llx\n",
@@ -626,6 +648,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         printf("cuda pool[%d]: freed %llu bytes at %llx\n", device, (unsigned long long) size, ptr);
 #endif
 
+        tracker.free(size);
         pool_used -= size;
 
         // all deallocations must be in reverse order of the allocations
@@ -635,13 +658,13 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 #endif  // defined(GGML_USE_VMM)
 
 std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(
-    int device, [[maybe_unused]] int stream_no) {
+    int device, [[maybe_unused]] int stream_no, ggml_cuda_pool_tracker & tracker) {
 #if defined(GGML_USE_VMM)
     if (ggml_cuda_info().devices[device].vmm) {
-        return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_vmm(device));
+        return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_vmm(device, tracker));
     }
 #endif  // defined(GGML_USE_VMM)
-    return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_leg(device));
+    return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_leg(device, tracker));
 }
 
 // destroying a cuBLAS handle while a graph is being captured in a different thread can result in a
@@ -9525,6 +9548,52 @@ static ggml_guid_t ggml_backend_cuda_guid() {
 
 bool ggml_backend_is_cuda(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cuda_guid());
+}
+
+bool ggml_backend_cuda_get_pool_stats(
+    ggml_backend_t backend, ggml_backend_cuda_pool_stats* stats) {
+    if (!ggml_backend_is_cuda(backend) || stats == nullptr) {
+        return false;
+    }
+
+    *stats = {};
+    ggml_backend_cuda_context* ctx =
+        static_cast<ggml_backend_cuda_context*>(backend->context);
+    stats->pool_kind = GGML_BACKEND_CUDA_POOL_NONE;
+    for (const ggml_cuda_pool_tracker& tracker : ctx->pool_trackers) {
+        const ggml_backend_cuda_pool_stats current = tracker.get_stats();
+        stats->tracking_enabled = stats->tracking_enabled || current.tracking_enabled;
+        stats->current_reserved_bytes += current.current_reserved_bytes;
+        stats->peak_reserved_bytes += current.peak_reserved_bytes;
+        stats->current_used_bytes += current.current_used_bytes;
+        stats->peak_used_bytes += current.peak_used_bytes;
+        stats->largest_request_bytes =
+            std::max(stats->largest_request_bytes, current.largest_request_bytes);
+        stats->allocation_count += current.allocation_count;
+        stats->reuse_count += current.reuse_count;
+        if (current.pool_kind == GGML_BACKEND_CUDA_POOL_NONE) {
+            continue;
+        }
+        if (stats->pool_kind == GGML_BACKEND_CUDA_POOL_NONE) {
+            stats->pool_kind = current.pool_kind;
+        } else if (stats->pool_kind != current.pool_kind) {
+            stats->pool_kind = GGML_BACKEND_CUDA_POOL_MIXED;
+        }
+    }
+    return true;
+}
+
+bool ggml_backend_cuda_reset_pool_stats(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+
+    ggml_backend_cuda_context* ctx =
+        static_cast<ggml_backend_cuda_context*>(backend->context);
+    for (ggml_cuda_pool_tracker& tracker : ctx->pool_trackers) {
+        tracker.reset();
+    }
+    return true;
 }
 
 int ggml_backend_cuda_get_device_count() {
