@@ -688,6 +688,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     ggml_cuda_lock_cv.wait(
         lock, [] { return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
+    for (auto it = mmq_prequant_cache.rbegin(); it != mmq_prequant_cache.rend(); ++it) {
+        it->second.storage.reset();
+    }
     mmq_prequant_cache.clear();
     mmq_prequant_target_tensor = nullptr;
     mmq_prequant_cache_key_tensor = nullptr;
