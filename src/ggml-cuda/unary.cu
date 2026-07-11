@@ -127,6 +127,20 @@ static __global__ void unary_op_kernel(const T * x, T * dst, const int k) {
     dst[i] = (T)op((float)x[i]);
 }
 
+template <float (*op)(float)>
+static __global__ void unary_f32_vec2_op_kernel(const float2 * x, float2 * dst, const int k2) {
+    ggml_cuda_pdl_lc();
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k2) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+    const float2 src = x[i];
+    dst[i] = make_float2(op(src.x), op(src.y));
+}
+
 template <float (*op)(float), typename src_t, typename dst_t>
 static __global__ void unary_cpy_op_kernel(const src_t * x, dst_t * dst, const int k) {
     const int i = blockDim.x*blockIdx.x + threadIdx.x;
@@ -190,6 +204,21 @@ static void unary_cuda(const T * x, T * dst, const int k, cudaStream_t stream) {
     ggml_cuda_kernel_launch(unary_op_kernel<op, T>, launch_params, x, dst, k);
 }
 
+template <float (*op)(float)>
+static void unary_f32_vec2_cuda(const float * x, float * dst, const int k, cudaStream_t stream) {
+    GGML_ASSERT(k % 2 == 0);
+    const int k2 = k / 2;
+    const int num_blocks = (k2 + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params =
+        ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream);
+    ggml_cuda_kernel_launch(
+        unary_f32_vec2_op_kernel<op>,
+        launch_params,
+        reinterpret_cast<const float2 *>(x),
+        reinterpret_cast<float2 *>(dst),
+        k2);
+}
+
 template <float (*op)(float), typename src_t, typename dst_t>
 static void unary_cpy_cuda(const src_t * x, dst_t * dst, const int k, cudaStream_t stream) {
     const int num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
@@ -249,7 +278,18 @@ static bool unary_cpy_f32_vec2_enabled(const ggml_tensor * src, const ggml_tenso
            reinterpret_cast<uintptr_t>(dst->data) % 4 == 0;
 }
 
-template <float (*op)(float)>
+static bool gelu_erf_f32_vec2_enabled(const ggml_tensor * src, const ggml_tensor * dst) {
+    return getenv("GGML_CUDA_DISABLE_GELU_ERF_F32_VEC2") == nullptr &&
+           src->type == GGML_TYPE_F32 &&
+           dst->type == GGML_TYPE_F32 &&
+           ggml_is_contiguous(src) &&
+           ggml_is_contiguous(dst) &&
+           ggml_nelements(src) % 2 == 0 &&
+           reinterpret_cast<uintptr_t>(src->data) % alignof(float2) == 0 &&
+           reinterpret_cast<uintptr_t>(dst->data) % alignof(float2) == 0;
+}
+
+template <float (*op)(float), bool use_f32_vec2 = false>
 void ggml_cuda_op_unary(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const void * src0_d = src0->data;
@@ -267,6 +307,13 @@ void ggml_cuda_op_unary(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     } else if (src0->type == GGML_TYPE_BF16) {
         unary_cuda<op>((const nv_bfloat16 *)src0_d, (nv_bfloat16 *)dst_d, ggml_nelements(src0), stream);
     } else {
+        if constexpr (use_f32_vec2) {
+            if (gelu_erf_f32_vec2_enabled(src0, dst)) {
+                unary_f32_vec2_cuda<op>(
+                    (const float *)src0_d, (float *)dst_d, ggml_nelements(src0), stream);
+                return;
+            }
+        }
         unary_cuda<op>((const float *)src0_d, (float *)dst_d, ggml_nelements(src0), stream);
     }
 }
@@ -340,7 +387,7 @@ void ggml_cuda_op_gelu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 void ggml_cuda_op_gelu_erf(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    ggml_cuda_op_unary<op_gelu_erf>(ctx, dst);
+    ggml_cuda_op_unary<op_gelu_erf, true>(ctx, dst);
 }
 
 void ggml_cuda_op_gelu_quick(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
