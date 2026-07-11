@@ -279,6 +279,39 @@ static __global__ void k_bin_bcast_axis2_f32(const float* __restrict__ src0,
     dst[offset] = bin_op(src0[offset], src1[i2]);
 }
 
+// src0 and dst intentionally allow exact aliasing for ggml_add_inplace.
+template <float (*bin_op)(const float, const float)>
+static __global__ void k_bin_bcast_single_repeat_axis_f32(const float* src0,
+                                                          const float* __restrict__ src1,
+                                                          float* dst,
+                                                          const int64_t inner4,
+                                                          const int64_t repeat,
+                                                          const int64_t outer) {
+    const int64_t i_outer = int64_t(blockIdx.z) * gridDim.y + blockIdx.y;
+    if (i_outer >= outer) {
+        return;
+    }
+
+    extern __shared__ float4 src1_cache[];
+    const auto* src0_4 = reinterpret_cast<const float4*>(src0);
+    const auto* src1_4 = reinterpret_cast<const float4*>(src1);
+    auto* dst_4 = reinterpret_cast<float4*>(dst);
+
+    const int64_t i_inner4 = threadIdx.x;
+    if (threadIdx.y == 0) {
+        src1_cache[i_inner4] = src1_4[i_outer * inner4 + i_inner4];
+    }
+    __syncthreads();
+
+    const float4 b = src1_cache[i_inner4];
+    for (int64_t i_repeat = threadIdx.y; i_repeat < repeat; i_repeat += blockDim.y) {
+        const int64_t i = (i_outer * repeat + i_repeat) * inner4 + i_inner4;
+        const float4 a = src0_4[i];
+        dst_4[i] = make_float4(bin_op(a.x, b.x), bin_op(a.y, b.y),
+                               bin_op(a.z, b.z), bin_op(a.w, b.w));
+    }
+}
+
 template <mmq_q8_1_ds_layout ds_layout, int cols_per_block>
 static __global__ void k_add_and_quantize_mmq_q8_1_warp_cols(const float* __restrict__ src0,
                                                              const float* __restrict__ src1,
@@ -666,6 +699,115 @@ static bool ggml_cuda_try_bin_bcast_axis_f32(const ggml_tensor* src0,
                                                                     dst->ne[1],
                                                                     dst->ne[2],
                                                                     axis);
+    return true;
+}
+
+static bool ggml_cuda_bin_bcast_ranges_overlap(const ggml_tensor* a, const ggml_tensor* b) {
+    if (a->data == nullptr || b->data == nullptr) {
+        return true;
+    }
+
+    const uintptr_t a_begin = reinterpret_cast<uintptr_t>(a->data);
+    const uintptr_t b_begin = reinterpret_cast<uintptr_t>(b->data);
+    const uintptr_t a_end = a_begin + ggml_nbytes(a);
+    const uintptr_t b_end = b_begin + ggml_nbytes(b);
+    return a_begin < b_end && b_begin < a_end;
+}
+
+template <float (*bin_op)(const float, const float)>
+static bool ggml_cuda_try_bin_bcast_single_repeat_axis_f32(const ggml_tensor* src0,
+                                                           const ggml_tensor* src1,
+                                                           ggml_tensor* dst,
+                                                           cudaStream_t stream) {
+    static const bool disabled =
+        std::getenv("GGML_CUDA_DISABLE_BIN_BCAST_SINGLE_REPEAT_AXIS_FAST") != nullptr &&
+        std::atoi(std::getenv("GGML_CUDA_DISABLE_BIN_BCAST_SINGLE_REPEAT_AXIS_FAST"));
+    if (disabled || src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 ||
+        dst->type != GGML_TYPE_F32 || !ggml_are_same_shape(src0, dst) ||
+        !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+
+    int repeat_axis = -1;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (src1->ne[i] == dst->ne[i]) {
+            continue;
+        }
+        if (repeat_axis >= 0 || src1->ne[i] != 1 || dst->ne[i] <= 1) {
+            return false;
+        }
+        repeat_axis = i;
+    }
+    if (repeat_axis < 0) {
+        return false;
+    }
+
+    int64_t inner = 1;
+    for (int i = 0; i < repeat_axis; ++i) {
+        inner *= dst->ne[i];
+    }
+    if (inner % 4 != 0) {
+        return false;
+    }
+
+    const int64_t inner4 = inner / 4;
+    constexpr int64_t max_threads = 256;
+    if (inner4 <= 0 || inner4 > max_threads) {
+        return false;
+    }
+
+    const int64_t repeat = dst->ne[repeat_axis];
+    const int64_t outer = ggml_nelements(dst) / (inner * repeat);
+    const int64_t block_y = std::min<int64_t>(repeat, max_threads / inner4);
+    // One block processes each independent outer slice. Require enough independent blocks,
+    // RHS reuse, and threads per block; the generic kernel splits low-parallelism repeats
+    // across its grid and is substantially faster outside this regime.
+    constexpr int64_t min_outer_blocks = 256;
+    constexpr int64_t min_repeat = 32;
+    constexpr int64_t min_block_threads = 128;
+    if (outer < min_outer_blocks || repeat < min_repeat || inner4 * block_y < min_block_threads ||
+        reinterpret_cast<uintptr_t>(src0->data) % alignof(float4) != 0 ||
+        reinterpret_cast<uintptr_t>(src1->data) % alignof(float4) != 0 ||
+        reinterpret_cast<uintptr_t>(dst->data) % alignof(float4) != 0) {
+        return false;
+    }
+
+    const bool src0_dst_exact = src0->data == dst->data && ggml_nbytes(src0) == ggml_nbytes(dst);
+    if ((ggml_cuda_bin_bcast_ranges_overlap(src0, dst) && !src0_dst_exact) ||
+        ggml_cuda_bin_bcast_ranges_overlap(src1, dst)) {
+        return false;
+    }
+
+    const int64_t grid_y = std::min<int64_t>(outer, 65535);
+    const int64_t grid_z = (outer + grid_y - 1) / grid_y;
+    if (grid_z > 65535) {
+        return false;
+    }
+
+    static const bool profile =
+        std::getenv("GGML_CUDA_PROFILE_BIN_BCAST_SINGLE_REPEAT_AXIS_FAST") != nullptr &&
+        std::atoi(std::getenv("GGML_CUDA_PROFILE_BIN_BCAST_SINGLE_REPEAT_AXIS_FAST"));
+    if (profile) {
+        fprintf(stderr,
+                "GGML_CUDA_PROFILE_BIN_BCAST_SINGLE_REPEAT_AXIS_FAST name=%s axis=%d inner=%lld "
+                "repeat=%lld outer=%lld inplace=%d\n",
+                dst->name,
+                repeat_axis,
+                (long long) inner,
+                (long long) repeat,
+                (long long) outer,
+                src0_dst_exact ? 1 : 0);
+    }
+
+    const dim3 blocks(1, grid_y, grid_z);
+    const dim3 threads(inner4, block_y, 1);
+    k_bin_bcast_single_repeat_axis_f32<bin_op>
+        <<<blocks, threads, inner4 * sizeof(float4), stream>>>((const float*) src0->data,
+                                                               (const float*) src1->data,
+                                                               (float*) dst->data,
+                                                               inner4,
+                                                               repeat,
+                                                               outer);
     return true;
 }
 
@@ -1274,6 +1416,10 @@ void ggml_cuda_op_add(ggml_backend_cuda_context& ctx, ggml_tensor* dst) {
         return;
     }
     if (ggml_cuda_try_bin_bcast_axis_f32<op_add>(dst->src[0], dst->src[1], dst, ctx.stream())) {
+        return;
+    }
+    if (ggml_cuda_try_bin_bcast_single_repeat_axis_f32<op_add>(
+            dst->src[0], dst->src[1], dst, ctx.stream())) {
         return;
     }
     if (ggml_cuda_try_bin_bcast_axis0_bf16_f32<op_add>(

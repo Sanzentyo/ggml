@@ -8001,6 +8001,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_bin_bcast(ggml_mul_inplace, GGML_TYPE_F32, {16, 5, 4, 3}, {1, 1, 1, 1}, 16));
     test_cases.emplace_back(new test_bin_bcast(ggml_sub_inplace, GGML_TYPE_F32, {16, 5, 4, 3}, {1, 1, 1, 1}, 16));
     test_cases.emplace_back(new test_bin_bcast(ggml_div_inplace, GGML_TYPE_F32, {16, 5, 4, 3}, {1, 1, 1, 1}, 16));
+    for (auto op : {ggml_add, ggml_add_inplace}) {
+        // Axis 0 remains on the generic fallback because its inner extent is not vector-aligned.
+        test_cases.emplace_back(new test_bin_bcast(op, GGML_TYPE_F32, {1, 5, 4, 3}, {8, 1, 1, 1}));
+        // Axis 1 and axis 2 meet the CUDA fast path's occupancy and RHS-reuse gates.
+        test_cases.emplace_back(new test_bin_bcast(op, GGML_TYPE_F32, {16, 1, 1, 256}, {1, 32, 1, 1}));
+        test_cases.emplace_back(new test_bin_bcast(op, GGML_TYPE_F32, {4, 4, 1, 256}, {1, 1, 32, 1}));
+        // Axis 3 cannot provide independent outer slices and exercises the fallback.
+        test_cases.emplace_back(new test_bin_bcast(op, GGML_TYPE_F32, {8, 5, 4, 1}, {1, 1, 1, 7}));
+        test_cases.emplace_back(new test_bin_bcast(op, GGML_TYPE_F32, {72, 1, 200, 8}, {1, 72, 1, 1}));
+        // Each performance gate independently keeps an otherwise eligible shape on fallback.
+        test_cases.emplace_back(new test_bin_bcast(op, GGML_TYPE_F32, {16, 1, 1, 255}, {1, 32, 1, 1}));
+        test_cases.emplace_back(new test_bin_bcast(op, GGML_TYPE_F32, {32, 1, 1, 256}, {1, 31, 1, 1}));
+        test_cases.emplace_back(new test_bin_bcast(op, GGML_TYPE_F32, {8, 1, 1, 256}, {1, 32, 1, 1}));
+        // A non-vector-aligned inner dimension is isolated with all performance gates satisfied.
+        test_cases.emplace_back(new test_bin_bcast(op, GGML_TYPE_F32, {5, 1, 16, 16}, {1, 32, 1, 1}));
+    }
 
     // fusion
     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {10, 5, 4, 3}, {2, 1, 1, 1}, 2));
