@@ -270,10 +270,7 @@ void ggml_cuda_mul_mat_q(
     const int64_t s03 = src0->nb[3] / ts_src0;
     const int64_t s3  =  dst->nb[3] / ts_dst;
 
-    const bool use_stream_k =
-        getenv("GGML_CUDA_DISABLE_MMQ_STREAM_K") == nullptr &&
-        ((GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
-                            || GGML_CUDA_CC_IS_CDNA(cc));
+    const bool use_stream_k = mmq_stream_k_enabled_host(cc);
     const bool profile_mmq = getenv("GGML_CUDA_PROFILE_MMQ") != nullptr;
     cudaEvent_t profile_start = nullptr;
     cudaEvent_t profile_after_quant = nullptr;
@@ -390,7 +387,8 @@ void ggml_cuda_mul_mat_q(
             produce_prequant_cache &&
             ctx.mmq_prequant_target_q8_only &&
             activation != MMQ_ACT_NONE &&
-            (src0->type == GGML_TYPE_Q4_1 || src0->type == GGML_TYPE_Q8_0) &&
+            (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q4_1 ||
+             src0->type == GGML_TYPE_Q8_0) &&
             ctx.mmq_prequant_target_consumer_type == src0->type &&
             dst->ne[1] >= q8_only_min_cols &&
             dst->ne[1] <= q8_only_max_cols;
@@ -659,11 +657,7 @@ void ggml_cuda_op_mul_mat_q(
     // The stream-k decomposition is only faster for recent NVIDIA GPUs.
     // Also its fixup needs to allocate a temporary buffer in the memory pool.
     // There are multiple parallel CUDA streams for src1_ncols != ne11 which would introduce a race condition for this buffer.
-    const bool use_stream_k =
-        getenv("GGML_CUDA_DISABLE_MMQ_STREAM_K") == nullptr &&
-        ((GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
-                            || GGML_CUDA_CC_IS_CDNA(cc)) &&
-        src1_ncols == ne11;
+    const bool use_stream_k = mmq_stream_k_enabled_host(cc) && src1_ncols == ne11;
     const bool q4_1_full_tile_fastpath =
         src0->type == GGML_TYPE_Q4_1 &&
         (getenv("GGML_CUDA_DISABLE_MMQ_Q4_1_FULL_TILE_FASTPATH") == nullptr ||

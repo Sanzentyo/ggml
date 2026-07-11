@@ -4472,6 +4472,17 @@ struct mmq_args {
     bool use_stream_k; bool q4_1_full_tile_fastpath; int64_t ncols_max;
 };
 
+template <ggml_type type>
+static bool mmq_q8_only_uses_shared_tile_writer(const bool q8_only) {
+    if (!q8_only) {
+        return false;
+    }
+    if constexpr (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0) {
+        return true;
+    }
+    return getenv("GGML_CUDA_ENABLE_MMQ_Q8_ONLY_DIRECT_WRITER") == nullptr;
+}
+
 template<ggml_type type>
 static size_t mmq_get_nbytes_shared(const int mmq_x, const int mmq_y, const int cc, const int warp_size, const int nwarps) {
     const tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(type, mmq_y);
@@ -4480,6 +4491,110 @@ static size_t mmq_get_nbytes_shared(const int mmq_x, const int mmq_y, const int 
     const size_t nbs_x = (turing_mma_available(cc) || amd_mfma_available(cc) || amd_wmma_available(cc)) ? mmq_y*mmq_tile_x_k*sizeof(int) : txs.qs*sizeof(int) + txs.dm*sizeof(half2) + txs.sc*sizeof(int);
     const size_t nbs_y = mmq_x * (sizeof(block_q8_1_mmq));
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, nwarps*warp_size*sizeof(int));
+}
+
+template <ggml_type type>
+static int mmq_select_mmq_x_host(
+        const int64_t nrows_x,
+        const int64_t ncols_max,
+        const bool    q8_only,
+        const int     cc,
+        const size_t  smpbo,
+        const int     warp_size,
+        const int     nwarps) {
+    const int mmq_x_max_default = get_mmq_x_max_host(cc);
+    const int mmq_x_max_env = [] {
+        const char * env = getenv("GGML_CUDA_MMQ_X_MAX");
+        if (env == nullptr) {
+            return 0;
+        }
+        return atoi(env);
+    }();
+
+    int mmq_x_max = mmq_x_max_default;
+    if (mmq_x_max_env >= 8 && mmq_x_max_env <= mmq_x_max_default) {
+        mmq_x_max = (mmq_x_max_env / 8) * 8;
+    } else if (type == GGML_TYPE_Q8_0 &&
+               getenv("GGML_CUDA_ENABLE_MMQ_Q8_0_196_X64") != nullptr &&
+               ncols_max == 196 && nrows_x == 448) {
+        mmq_x_max = std::min(mmq_x_max_default, 64);
+    } else if (type == GGML_TYPE_Q4_1 && ncols_max == 4096) {
+        const char * env = getenv("GGML_CUDA_ENABLE_MMQ_Q4_1_4096_X_MAX");
+        if (env != nullptr) {
+            const int cap = atoi(env);
+            if (cap >= 8 && cap <= mmq_x_max_default) {
+                mmq_x_max = (cap / 8) * 8;
+            }
+        } else if (blackwell_mma_available(cc)) {
+            mmq_x_max = std::min(mmq_x_max_default, 104);
+        }
+    } else if (blackwell_mma_available(cc)) {
+        if (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1) {
+            mmq_x_max = std::min(mmq_x_max_default, 104);
+        }
+    }
+
+    const int mmq_y = get_mmq_y_host(cc);
+    int mmq_x_best = 0;
+    int ntiles_x_best = INT_MAX;
+    const bool q8_only_shared_tile_writer = mmq_q8_only_uses_shared_tile_writer<type>(q8_only);
+
+    for (int mmq_x = 8; mmq_x <= mmq_x_max && ntiles_x_best > 1; mmq_x += 8) {
+        const int granularity = mmq_get_granularity_host(mmq_x, cc);
+        const size_t nbytes_shared = mmq_get_nbytes_shared<type>(mmq_x, mmq_y, cc, warp_size, nwarps);
+        const size_t nbytes_shared_effective =
+            nbytes_shared + (q8_only_shared_tile_writer ? (size_t) mmq_x * mmq_y * sizeof(float) : 0);
+
+        if (mmq_x % granularity != 0 || nbytes_shared_effective > smpbo ||
+            (q8_only && !turing_mma_available(cc))) {
+            continue;
+        }
+
+        const int ntiles_x = (ncols_max + mmq_x - 1) / mmq_x;
+        if (ntiles_x < ntiles_x_best) {
+            mmq_x_best = mmq_x;
+            ntiles_x_best = ntiles_x;
+        }
+    }
+
+    return mmq_x_best;
+}
+
+static bool mmq_stream_k_enabled_host(const int cc) {
+    return getenv("GGML_CUDA_DISABLE_MMQ_STREAM_K") == nullptr &&
+           ((GGML_CUDA_CC_IS_NVIDIA(cc) &&
+             ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
+            GGML_CUDA_CC_IS_CDNA(cc));
+}
+
+struct mmq_stream_k_schedule_host {
+    int ntiles_dst;
+    int tiles_efficiency_percent;
+    int stream_blocks;
+    bool fixup_needed;
+};
+
+static mmq_stream_k_schedule_host mmq_get_stream_k_schedule_host(
+        const int ntx,
+        const int nty,
+        const int ntzw,
+        const int cc,
+        const int nsm) {
+    const int ntiles_dst = ntx * nty * ntzw;
+    const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
+    const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm * tiles_nwaves);
+    const int stream_k_tile_efficiency_min = [] {
+        const char * env = getenv("GGML_CUDA_MMQ_STREAM_K_TILE_EFFICIENCY_MIN");
+        return env == nullptr ? 90 : atoi(env);
+    }();
+    const int stream_blocks =
+        GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= stream_k_tile_efficiency_min ?
+            ntiles_dst : nsm;
+
+    return {ntiles_dst,
+            tiles_efficiency_percent,
+            stream_blocks,
+            ntiles_dst % stream_blocks != 0};
 }
 
 template <ggml_type type, int mmq_x>
@@ -4544,7 +4659,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
         }
     }();
 
-    if constexpr (type == GGML_TYPE_Q4_1 || type == GGML_TYPE_Q8_0) {
+    if constexpr (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1 || type == GGML_TYPE_Q8_0) {
         if (args.q8_only_dst != nullptr) {
             GGML_ASSERT(turing_mma_available(cc));
             GGML_ASSERT(!args.use_stream_k);
@@ -4552,7 +4667,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
             GGML_ASSERT(args.expert_bounds == nullptr);
 
             const bool shared_tile_q8_only =
-                type == GGML_TYPE_Q8_0 || getenv("GGML_CUDA_ENABLE_MMQ_Q8_ONLY_DIRECT_WRITER") == nullptr;
+                mmq_q8_only_uses_shared_tile_writer<type>(args.q8_only_dst != nullptr);
             const int nbytes_shared_q8_only =
                 nbytes_shared + (shared_tile_q8_only ? mmq_x * mmq_y * (int) sizeof(float) : 0);
             CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q_q8_only<type, mmq_x, false, MMQ_ACT_DYNAMIC, false>), nbytes_shared);
@@ -4673,21 +4788,13 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     // For the stream-k kernel it is possible to run it with tiling by setting the number of CUDA blocks equal to the number of tiles.
     // This is worthwhile if the efficiency of tiling is high and skipping the fixup kernel is more important.
-    const int ntiles_dst = ntx * nty * ntzw;
-    const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
-    const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*tiles_nwaves);
-    const int stream_k_tile_efficiency_min = [] {
-        const char * env = getenv("GGML_CUDA_MMQ_STREAM_K_TILE_EFFICIENCY_MIN");
-        return env == nullptr ? 90 : atoi(env);
-    }();
-    const dim3 block_nums_stream_k(
-        GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= stream_k_tile_efficiency_min ? ntiles_dst : nsm,
-        1,
-        1);
+    const mmq_stream_k_schedule_host stream_k_schedule =
+        mmq_get_stream_k_schedule_host(ntx, nty, ntzw, cc, nsm);
+    const dim3 block_nums_stream_k(stream_k_schedule.stream_blocks, 1, 1);
 
-    GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
+    GGML_ASSERT(stream_k_schedule.ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
 
-    const bool fixup_needed = ntiles_dst % block_nums_stream_k.x != 0;
+    const bool fixup_needed = stream_k_schedule.fixup_needed;
     if (profile_launch) {
         fprintf(stderr,
                 "GGML_CUDA_PROFILE_MMQ_LAUNCH type=%s mmq_x=%d mmq_y=%d stream_k=1 "
@@ -4705,9 +4812,9 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
                 ntx,
                 nty,
                 ntzw,
-                ntiles_dst,
+                stream_k_schedule.ntiles_dst,
                 nsm,
-                tiles_efficiency_percent,
+                stream_k_schedule.tiles_efficiency_percent,
                 block_nums_stream_k.x,
                 fixup_needed ? 1 : 0,
                 nbytes_shared);
@@ -4789,63 +4896,14 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
     const int warp_size = ggml_cuda_info().devices[id].warp_size;
     const int nwarps    = mmq_get_nwarps_host(cc, warp_size);
 
-    const int mmq_x_max_default = get_mmq_x_max_host(cc);
-    const int mmq_x_max_env = [] {
-        const char * env = getenv("GGML_CUDA_MMQ_X_MAX");
-        if (env == nullptr) {
-            return 0;
-        }
-        return atoi(env);
-    }();
-    int mmq_x_max = mmq_x_max_default;
-    if (mmq_x_max_env >= 8 && mmq_x_max_env <= mmq_x_max_default) {
-        mmq_x_max = (mmq_x_max_env / 8) * 8;
-    } else if (type == GGML_TYPE_Q8_0 &&
-               getenv("GGML_CUDA_ENABLE_MMQ_Q8_0_196_X64") != nullptr &&
-               args.ncols_max == 196 && args.nrows_x == 448) {
-        mmq_x_max = std::min(mmq_x_max_default, 64);
-    } else if (type == GGML_TYPE_Q4_1 && args.ncols_max == 4096) {
-        const char * env = getenv("GGML_CUDA_ENABLE_MMQ_Q4_1_4096_X_MAX");
-        if (env != nullptr) {
-            const int cap = atoi(env);
-            if (cap >= 8 && cap <= mmq_x_max_default) {
-                mmq_x_max = (cap / 8) * 8;
-            }
-        } else if (blackwell_mma_available(cc)) {
-            mmq_x_max = std::min(mmq_x_max_default, 104);
-        }
-    } else if (blackwell_mma_available(cc)) {
-        if (type == GGML_TYPE_Q4_0) {
-            mmq_x_max = std::min(mmq_x_max_default, 104);
-        } else if (type == GGML_TYPE_Q4_1) {
-            mmq_x_max = std::min(mmq_x_max_default, 104);
-        }
-    }
-    const int mmq_y = get_mmq_y_host(cc);
-
-    int mmq_x_best  = 0;
-    int ntiles_x_best = INT_MAX;
-    const bool q8_only_shared_tile_writer =
-        args.q8_only_dst != nullptr && getenv("GGML_CUDA_ENABLE_MMQ_Q8_ONLY_DIRECT_WRITER") == nullptr;
-
-    for (int mmq_x = 8; mmq_x <= mmq_x_max && ntiles_x_best > 1; mmq_x += 8) {
-        const int granularity = mmq_get_granularity_host(mmq_x, cc);
-        const size_t nbytes_shared = mmq_get_nbytes_shared<type>(mmq_x, mmq_y, cc, warp_size, nwarps);
-        const size_t nbytes_shared_effective =
-            nbytes_shared + (q8_only_shared_tile_writer ? (size_t) mmq_x * mmq_y * sizeof(float) : 0);
-
-        if (mmq_x % granularity != 0 || nbytes_shared_effective > smpbo ||
-            (args.q8_only_dst != nullptr && !turing_mma_available(cc))) {
-            continue;
-        }
-
-        const int ntiles_x = (args.ncols_max + mmq_x - 1) / mmq_x;
-
-        if (ntiles_x < ntiles_x_best) {
-            mmq_x_best = mmq_x;
-            ntiles_x_best = ntiles_x;
-        }
-    }
+    const int mmq_x_best = mmq_select_mmq_x_host<type>(
+        args.nrows_x,
+        args.ncols_max,
+        args.q8_only_dst != nullptr,
+        cc,
+        smpbo,
+        warp_size,
+        nwarps);
 
     switch (mmq_x_best) {
         case   8:

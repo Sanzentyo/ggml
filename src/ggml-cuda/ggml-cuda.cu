@@ -4171,82 +4171,24 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q_broadcast_bias(const ggml_tensor
            bias_tensor->ne[0] == dst->ne[0] && ggml_nelements(bias_tensor) == dst->ne[0];
 }
 
-template <ggml_type type>
-static int ggml_cuda_predict_mmq_x_best(const int64_t ncols_max,
-                                        const int cc,
-                                        const size_t smpbo,
-                                        const int warp_size,
-                                        const int nwarps) {
-    const int mmq_x_max_default = get_mmq_x_max_host(cc);
-    const int mmq_x_max_env = [] {
-        const char* env = getenv("GGML_CUDA_MMQ_X_MAX");
-        if (env == nullptr) {
-            return 0;
-        }
-        return atoi(env);
-    }();
-
-    int mmq_x_max = mmq_x_max_default;
-    if (mmq_x_max_env >= 8 && mmq_x_max_env <= mmq_x_max_default) {
-        mmq_x_max = (mmq_x_max_env / 8) * 8;
-    } else if (type == GGML_TYPE_Q8_0 && getenv("GGML_CUDA_ENABLE_MMQ_Q8_0_196_X64") != nullptr &&
-               ncols_max == 196) {
-        mmq_x_max = std::min(mmq_x_max_default, 64);
-    } else if (type == GGML_TYPE_Q4_1 && ncols_max == 4096) {
-        const char* env = getenv("GGML_CUDA_ENABLE_MMQ_Q4_1_4096_X_MAX");
-        if (env != nullptr) {
-            const int cap = atoi(env);
-            if (cap >= 8 && cap <= mmq_x_max_default) {
-                mmq_x_max = (cap / 8) * 8;
-            }
-        } else if (blackwell_mma_available(cc)) {
-            mmq_x_max = std::min(mmq_x_max_default, 104);
-        }
-    } else if (blackwell_mma_available(cc)) {
-        if (type == GGML_TYPE_Q4_0) {
-            mmq_x_max = std::min(mmq_x_max_default, 104);
-        } else if (type == GGML_TYPE_Q4_1) {
-            mmq_x_max = std::min(mmq_x_max_default, 104);
-        }
-    }
-
-    const int mmq_y = get_mmq_y_host(cc);
-    int mmq_x_best = 0;
-    int ntiles_x_best = INT_MAX;
-
-    for (int mmq_x = 8; mmq_x <= mmq_x_max && ntiles_x_best > 1; mmq_x += 8) {
-        const int granularity = mmq_get_granularity_host(mmq_x, cc);
-        if (mmq_x % granularity != 0 ||
-            mmq_get_nbytes_shared<type>(mmq_x, mmq_y, cc, warp_size, nwarps) > smpbo) {
-            continue;
-        }
-
-        const int ntiles_x = (ncols_max + mmq_x - 1) / mmq_x;
-        if (ntiles_x < ntiles_x_best) {
-            mmq_x_best = mmq_x;
-            ntiles_x_best = ntiles_x;
-        }
-    }
-
-    return mmq_x_best;
-}
-
-static int ggml_cuda_predict_mmq_x_best(const ggml_type type,
-                                        const int64_t ncols_max,
-                                        const int cc,
-                                        const size_t smpbo,
-                                        const int warp_size,
-                                        const int nwarps) {
+static int ggml_cuda_select_mmq_x_host(const ggml_type type,
+                                       const int64_t nrows_x,
+                                       const int64_t ncols_max,
+                                       const bool q8_only,
+                                       const int cc,
+                                       const size_t smpbo,
+                                       const int warp_size,
+                                       const int nwarps) {
     switch (type) {
         case GGML_TYPE_Q8_0:
-            return ggml_cuda_predict_mmq_x_best<GGML_TYPE_Q8_0>(
-                ncols_max, cc, smpbo, warp_size, nwarps);
+            return mmq_select_mmq_x_host<GGML_TYPE_Q8_0>(
+                nrows_x, ncols_max, q8_only, cc, smpbo, warp_size, nwarps);
         case GGML_TYPE_Q4_0:
-            return ggml_cuda_predict_mmq_x_best<GGML_TYPE_Q4_0>(
-                ncols_max, cc, smpbo, warp_size, nwarps);
+            return mmq_select_mmq_x_host<GGML_TYPE_Q4_0>(
+                nrows_x, ncols_max, q8_only, cc, smpbo, warp_size, nwarps);
         case GGML_TYPE_Q4_1:
-            return ggml_cuda_predict_mmq_x_best<GGML_TYPE_Q4_1>(
-                ncols_max, cc, smpbo, warp_size, nwarps);
+            return mmq_select_mmq_x_host<GGML_TYPE_Q4_1>(
+                nrows_x, ncols_max, q8_only, cc, smpbo, warp_size, nwarps);
         default:
             return 0;
     }
@@ -4265,15 +4207,12 @@ static bool ggml_cuda_mmq_bias_fusion_has_exact_stream_k_schedule(const ggml_ten
     const int nwarps = mmq_get_nwarps_host(cc, warp_size);
     const int mmq_y = get_mmq_y_host(cc);
 
-    const bool use_stream_k =
-        (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
-        GGML_CUDA_CC_IS_CDNA(cc);
-    if (!use_stream_k) {
+    if (!mmq_stream_k_enabled_host(cc)) {
         return true;
     }
 
-    const int mmq_x =
-        ggml_cuda_predict_mmq_x_best(src0->type, dst->ne[1], cc, smpbo, warp_size, nwarps);
+    const int mmq_x = ggml_cuda_select_mmq_x_host(
+        src0->type, dst->ne[0], dst->ne[1], false, cc, smpbo, warp_size, nwarps);
     if (mmq_x == 0) {
         return false;
     }
@@ -4281,13 +4220,7 @@ static bool ggml_cuda_mmq_bias_fusion_has_exact_stream_k_schedule(const ggml_ten
     const int ntx = (dst->ne[1] + mmq_x - 1) / mmq_x;
     const int nty = (dst->ne[0] + mmq_y - 1) / mmq_y;
     const int ntzw = src1->ne[2] * src1->ne[3];
-    const int ntiles_dst = ntx * nty * ntzw;
-    const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
-    const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm * tiles_nwaves);
-    const int stream_blocks =
-        GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : nsm;
-
-    return ntiles_dst % stream_blocks == 0;
+    return !mmq_get_stream_k_schedule_host(ntx, nty, ntzw, cc, nsm).fixup_needed;
 }
 
 static void ggml_cuda_log_mmq_bias_fusion_reject(const ggml_tensor* mm_node,
@@ -4711,8 +4644,13 @@ static ggml_type ggml_cuda_mmq_prequant_consumer_type(const ggml_cgraph* cgraph,
     }
 
     const ggml_tensor* consumer_weight = consumer->src[0];
-    if (consumer_weight == nullptr ||
-        (consumer_weight->type != GGML_TYPE_Q4_1 && consumer_weight->type != GGML_TYPE_Q8_0)) {
+    if (consumer_weight == nullptr) {
+        return GGML_TYPE_COUNT;
+    }
+    const bool supported_consumer_type =
+        consumer_weight->type == GGML_TYPE_Q4_1 || consumer_weight->type == GGML_TYPE_Q8_0 ||
+        (force && consumer_weight->type == GGML_TYPE_Q4_0);
+    if (!supported_consumer_type) {
         return GGML_TYPE_COUNT;
     }
 
@@ -4724,8 +4662,82 @@ static ggml_type ggml_cuda_mmq_prequant_consumer_type(const ggml_cgraph* cgraph,
     return consumer_weight->type;
 }
 
+static bool ggml_cuda_mmq_q4_0_q8_only_schedule_eligible(
+        const ggml_backend_cuda_context& ctx,
+        const ggml_tensor* mm_node,
+        const ggml_tensor* producer_out) {
+    const ggml_tensor* src0 = mm_node != nullptr ? mm_node->src[0] : nullptr;
+    const ggml_tensor* src1 = mm_node != nullptr ? mm_node->src[1] : nullptr;
+    if (mm_node == nullptr || mm_node->op != GGML_OP_MUL_MAT || src0 == nullptr || src1 == nullptr ||
+        src0->type != GGML_TYPE_Q4_0) {
+        return false;
+    }
+
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const int nsm = ggml_cuda_info().devices[ctx.device].nsm;
+    const size_t smpbo = ggml_cuda_info().devices[ctx.device].smpbo;
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+    const int nwarps = mmq_get_nwarps_host(cc, warp_size);
+    const int mmq_y = get_mmq_y_host(cc);
+
+    const int regular_mmq_x = ggml_cuda_select_mmq_x_host(
+        GGML_TYPE_Q4_0,
+        producer_out->ne[0],
+        producer_out->ne[1],
+        false,
+        cc,
+        smpbo,
+        warp_size,
+        nwarps);
+    const int q8_only_mmq_x = ggml_cuda_select_mmq_x_host(
+        GGML_TYPE_Q4_0,
+        producer_out->ne[0],
+        producer_out->ne[1],
+        true,
+        cc,
+        smpbo,
+        warp_size,
+        nwarps);
+    const bool selectors_available = regular_mmq_x != 0 && q8_only_mmq_x != 0;
+
+    const bool use_stream_k = mmq_stream_k_enabled_host(cc);
+    mmq_stream_k_schedule_host regular_schedule{};
+    if (use_stream_k && regular_mmq_x != 0) {
+        const int ntx = (producer_out->ne[1] + regular_mmq_x - 1) / regular_mmq_x;
+        const int nty = (producer_out->ne[0] + mmq_y - 1) / mmq_y;
+        const int ntzw = src1->ne[2] * src1->ne[3];
+        regular_schedule = mmq_get_stream_k_schedule_host(ntx, nty, ntzw, cc, nsm);
+    }
+
+    const bool no_partial_fixup = !use_stream_k || !regular_schedule.fixup_needed;
+    const bool eligible = selectors_available && no_partial_fixup;
+    if (getenv("GGML_CUDA_PROFILE_MMQ_Q8_ONLY_CANDIDATES") != nullptr) {
+        const char* reason = eligible ? "eligible" :
+                             !selectors_available ? "selector-failed" : "stream-k-partial-fixup";
+        fprintf(stderr,
+                "GGML_CUDA_PROFILE_MMQ_Q4_0_Q8_ONLY_SCHEDULE producer=%s "
+                "producer_ne=%lld,%lld,%lld,%lld regular_mmq_x=%d q8_only_mmq_x=%d "
+                "stream_k=%d ntiles_dst=%d stream_blocks=%d fixup=%d eligible=%d reason=%s\n",
+                producer_out->name,
+                (long long) producer_out->ne[0],
+                (long long) producer_out->ne[1],
+                (long long) producer_out->ne[2],
+                (long long) producer_out->ne[3],
+                regular_mmq_x,
+                q8_only_mmq_x,
+                use_stream_k ? 1 : 0,
+                regular_schedule.ntiles_dst,
+                regular_schedule.stream_blocks,
+                regular_schedule.fixup_needed ? 1 : 0,
+                eligible ? 1 : 0,
+                reason);
+    }
+    return eligible;
+}
+
 static bool ggml_cuda_mmq_q8_only_producer_candidate(const ggml_backend_cuda_context& ctx,
                                                      const ggml_cgraph* cgraph,
+                                                     const ggml_tensor* mm_node,
                                                      const int producer_out_idx) {
     if (getenv("GGML_CUDA_PROFILE_MMQ_Q8_ONLY_CANDIDATES") == nullptr &&
         getenv("GGML_CUDA_DISABLE_MMQ_Q8_ONLY_PRODUCER_FUSION") != nullptr) {
@@ -4748,7 +4760,8 @@ static bool ggml_cuda_mmq_q8_only_producer_candidate(const ggml_backend_cuda_con
     const bool direct_q_mmq_consumer =
         consumer->op == GGML_OP_MUL_MAT && consumer->src[1] == producer_out &&
         consumer->src[2] == nullptr && weight != nullptr &&
-        (weight->type == GGML_TYPE_Q4_1 || weight->type == GGML_TYPE_Q8_0) &&
+        (weight->type == GGML_TYPE_Q4_0 || weight->type == GGML_TYPE_Q4_1 ||
+         weight->type == GGML_TYPE_Q8_0) &&
         producer_out->type == GGML_TYPE_F32 && consumer->type == GGML_TYPE_F32 &&
         ggml_is_contiguous(producer_out) && producer_out->ne[2] == 1 && producer_out->ne[3] == 1;
     if (!direct_q_mmq_consumer) {
@@ -4779,6 +4792,10 @@ static bool ggml_cuda_mmq_q8_only_producer_candidate(const ggml_backend_cuda_con
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     if (!turing_mma_available(cc) ||
         !ggml_cuda_should_use_mmq(weight->type, cc, producer_out->ne[1], /*n_experts=*/0)) {
+        return false;
+    }
+    if (weight->type == GGML_TYPE_Q4_0 &&
+        !ggml_cuda_mmq_q4_0_q8_only_schedule_eligible(ctx, mm_node, producer_out)) {
         return false;
     }
 
@@ -8494,7 +8511,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context* cuda_ctx, ggml_cgraph* 
                 }
 
                 const bool q8_only_candidate =
-                    ggml_cuda_mmq_q8_only_producer_candidate(*cuda_ctx, cgraph, unary_idx);
+                    ggml_cuda_mmq_q8_only_producer_candidate(*cuda_ctx, cgraph, mm_node, unary_idx);
                 const bool q8_only_enabled =
                     q8_only_candidate &&
                     getenv("GGML_CUDA_DISABLE_MMQ_Q8_ONLY_PRODUCER_FUSION") == nullptr;
