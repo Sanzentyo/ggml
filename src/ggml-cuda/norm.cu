@@ -27,6 +27,14 @@ static bool ggml_cuda_enable_norm_1024_affine_axis0() {
     return enabled;
 }
 
+static bool ggml_cuda_enable_group_norm_centered_recompute() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("GGML_CUDA_DISABLE_GROUP_NORM_CENTERED_RECOMPUTE");
+        return env == nullptr || std::atoi(env) == 0;
+    }();
+    return enabled;
+}
+
 template <int block_size,
           bool do_multiply = false,
           bool do_add = false,
@@ -338,11 +346,12 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
     }
 }
 
-// Preserve the exact reduction and intermediate F32 rounding of group_norm_f32, then apply the
-// three standalone F32 operations used by GroupNorm's affine epilogue. In particular, keeping the
-// centered-value store before the variance reduction matches group_norm_f32, while the explicit
-// round-to-nearest operations match the stores between GROUP_NORM, MUL, and ADD.
-template <int block_size>
+// Preserve the exact reduction and F32 rounding of group_norm_f32, then apply the three standalone
+// F32 operations used by GroupNorm's affine epilogue. The default variant avoids materializing the
+// centered values by recomputing the same F32 subtraction in the final pass. The rollback variant
+// retains the original centered-value store/load, and both variants explicitly preserve the
+// round-to-nearest operations between GROUP_NORM, MUL, and ADD.
+template <int block_size, bool recompute_centered>
 static __global__ void group_norm_affine_relu_f32(const float* x,
                                                   const float* mul,
                                                   const float* add,
@@ -372,7 +381,9 @@ static __global__ void group_norm_affine_relu_f32(const float* x,
 
     for (int j = start; j < end; j += block_size) {
         const float xi = x[j] - mean;
-        dst[j] = xi;
+        if constexpr (!recompute_centered) {
+            dst[j] = xi;
+        }
         tmp += xi * xi;
     }
 
@@ -384,7 +395,13 @@ static __global__ void group_norm_affine_relu_f32(const float* x,
     const int group_start = blockIdx.x * group_size;
     for (int j = start; j < end; j += block_size) {
         const int channel = group_channel + fastdiv(j - group_start, plane_size_packed);
-        const float norm = __fmul_rn(dst[j], inv_std);
+        float centered;
+        if constexpr (recompute_centered) {
+            centered = x[j] - mean;
+        } else {
+            centered = dst[j];
+        }
+        const float norm = __fmul_rn(centered, inv_std);
         const float affine_mul = __fmul_rn(norm, mul[channel]);
         const float affine_add = __fadd_rn(affine_mul, add[channel]);
         dst[j] = fmaxf(affine_add, 0.0f);
@@ -1134,6 +1151,7 @@ static void group_norm_f32_cuda(
     }
 }
 
+template <bool recompute_centered>
 static void group_norm_affine_relu_f32_cuda(const float* x,
                                             const float* mul,
                                             const float* add,
@@ -1148,12 +1166,21 @@ static void group_norm_affine_relu_f32_cuda(const float* x,
     const uint3 plane_size_packed = init_fastdiv_values(plane_size);
     if (group_size < 1024) {
         const dim3 block_dims(WARP_SIZE, 1, 1);
-        group_norm_affine_relu_f32<WARP_SIZE><<<num_groups, block_dims, 0, stream>>>(
+        group_norm_affine_relu_f32<WARP_SIZE,
+                                   recompute_centered><<<num_groups, block_dims, 0, stream>>>(
             x, mul, add, dst, group_size, ne_elements, eps, plane_size_packed, channels_per_group);
     } else {
         const dim3 block_dims(1024, 1, 1);
-        group_norm_affine_relu_f32<1024><<<num_groups, block_dims, 32 * sizeof(float), stream>>>(
-            x, mul, add, dst, group_size, ne_elements, eps, plane_size_packed, channels_per_group);
+        group_norm_affine_relu_f32<1024, recompute_centered>
+            <<<num_groups, block_dims, 32 * sizeof(float), stream>>>(x,
+                                                                     mul,
+                                                                     add,
+                                                                     dst,
+                                                                     group_size,
+                                                                     ne_elements,
+                                                                     eps,
+                                                                     plane_size_packed,
+                                                                     channels_per_group);
     }
 }
 
@@ -1663,17 +1690,31 @@ void ggml_cuda_op_group_norm_affine_relu(ggml_backend_cuda_context& ctx,
     const int plane_size = src0->ne[0] * src0->ne[1];
     const int channels_per_group = src0->ne[2] / num_groups;
     const int group_size = plane_size * channels_per_group;
-    group_norm_affine_relu_f32_cuda((const float*) src0->data,
-                                    (const float*) mul_src->data,
-                                    (const float*) add_src->data,
-                                    (float*) relu->data,
-                                    num_groups * src0->ne[3],
-                                    eps,
-                                    group_size,
-                                    ggml_nelements(src0),
-                                    plane_size,
-                                    channels_per_group,
-                                    ctx.stream());
+    if (ggml_cuda_enable_group_norm_centered_recompute()) {
+        group_norm_affine_relu_f32_cuda<true>((const float*) src0->data,
+                                              (const float*) mul_src->data,
+                                              (const float*) add_src->data,
+                                              (float*) relu->data,
+                                              num_groups * src0->ne[3],
+                                              eps,
+                                              group_size,
+                                              ggml_nelements(src0),
+                                              plane_size,
+                                              channels_per_group,
+                                              ctx.stream());
+    } else {
+        group_norm_affine_relu_f32_cuda<false>((const float*) src0->data,
+                                               (const float*) mul_src->data,
+                                               (const float*) add_src->data,
+                                               (float*) relu->data,
+                                               num_groups * src0->ne[3],
+                                               eps,
+                                               group_size,
+                                               ggml_nelements(src0),
+                                               plane_size,
+                                               channels_per_group,
+                                               ctx.stream());
+    }
 }
 
 void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
