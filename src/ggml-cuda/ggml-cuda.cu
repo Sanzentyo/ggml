@@ -7150,7 +7150,12 @@ static bool ggml_cuda_can_fuse_cont_rope_pair(const ggml_cgraph* cgraph,
     }
 
     const int outputs[1] = {idxs[8]};
-    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, 9, ops, outputs, 1)) {
+    // The packed tensor feeds the rope chain through reshape/view aliases, so the generic
+    // nine-node check cannot see that dependency. Require it to have one non-output consumer,
+    // then validate the rope subgraph separately; the alias and memory checks below close it.
+    if ((cgraph->nodes[node_idx]->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
+        ggml_node_get_use_count(cgraph, node_idx) != 1 ||
+        !ggml_can_fuse_subgraph_ext(cgraph, idxs + 1, 8, ops + 1, outputs, 1)) {
         return reject("subgraph");
     }
 
